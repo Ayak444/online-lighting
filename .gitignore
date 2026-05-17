@@ -1,0 +1,12 @@
+config/db.local.php
+config/integrations.local.php
+.dbdata/
+.runtime-logs/
+.runtime-php.ini
+*.log
+*.err
+*.pid
+*.tmp
+.env
+.DS_Store
+Thumbs.db
