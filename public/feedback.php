@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
+require_once __DIR__ . '/../config/notification_delivery.php';
 
 $user = require_login('login.php');
 $userId = (int) $user['user_id'];
@@ -45,8 +46,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $old['subject'],
             $old['content'],
         ]);
+        $feedbackId = (int) db()->lastInsertId();
 
-        audit_log($userId, 'feedback_create', 'feedbacks', (string) db()->lastInsertId(), null, $old);
+        $stmt = db()->prepare(
+            'INSERT INTO notifications (user_id, channel, subject, content, status)
+             VALUES (?, "email", ?, ?, "pending")'
+        );
+        $stmt->execute([
+            $userId,
+            '已收到您的問題回饋',
+            '您好，我們已收到您的問題回饋：「' . $old['subject'] . '」。後台管理員處理或回覆時，系統會再寄 Email 通知您。',
+        ]);
+        notification_process_by_id((int) db()->lastInsertId(), true);
+
+        audit_log($userId, 'feedback_create', 'feedbacks', (string) $feedbackId, null, $old);
         set_flash('問題回饋已送出。');
         redirect('feedback.php');
     }

@@ -26,6 +26,11 @@ $integrationConfig = [
             'driver' => getenv('NOTIFICATION_EMAIL_DRIVER') ?: 'mock',
             'from_address' => getenv('NOTIFICATION_EMAIL_FROM_ADDRESS') ?: 'no-reply@example.test',
             'from_name' => getenv('NOTIFICATION_EMAIL_FROM_NAME') ?: '線上點燈系統',
+            'smtp_host' => getenv('SMTP_HOST') ?: '',
+            'smtp_port' => (int) (getenv('SMTP_PORT') ?: 587),
+            'smtp_username' => getenv('SMTP_USERNAME') ?: '',
+            'smtp_password' => getenv('SMTP_PASSWORD') ?: '',
+            'smtp_encryption' => getenv('SMTP_ENCRYPTION') ?: 'tls',
         ],
         'sms' => [
             'driver' => getenv('NOTIFICATION_SMS_DRIVER') ?: 'mock',

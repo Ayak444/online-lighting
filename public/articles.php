@@ -64,7 +64,7 @@ $articles = $stmt->fetchAll();
                                 </div>
                                 <a href="article.php?id=<?= (int) $article['article_id'] ?>">閱讀全文</a>
                             </div>
-                            <p><?= e(mb_substr(strip_tags($article['content']), 0, 140)) ?></p>
+                            <p><?= e(text_excerpt(strip_tags($article['content']), 140)) ?></p>
                         </article>
                     <?php endforeach; ?>
                 </div>

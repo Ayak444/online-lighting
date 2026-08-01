@@ -196,6 +196,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('lantern_types.php');
         }
     }
+
+    if ($errors === [] && $action === 'delete_lantern_type') {
+        $typeId = (int) ($_POST['type_id'] ?? 0);
+
+        $stmt = db()->prepare('SELECT * FROM lantern_types WHERE type_id = ? LIMIT 1');
+        $stmt->execute([$typeId]);
+        $before = $stmt->fetch();
+
+        if (!$before) {
+            $errors[] = '找不到要刪除的燈種。';
+        } else {
+            $dependencyChecks = [
+                'lamp_positions' => 'SELECT COUNT(*) FROM lamp_positions WHERE type_id = ?',
+                'order_items' => 'SELECT COUNT(*) FROM order_items WHERE type_id = ?',
+                'cart_items' => 'SELECT COUNT(*) FROM cart_items WHERE type_id = ?',
+                'annual_flow_rules' => 'SELECT COUNT(*) FROM annual_flow_rules WHERE type_id = ?',
+            ];
+            $dependencies = [];
+
+            foreach ($dependencyChecks as $table => $sql) {
+                $stmt = db()->prepare($sql);
+                $stmt->execute([$typeId]);
+                $count = (int) $stmt->fetchColumn();
+                if ($count > 0) {
+                    $dependencies[] = $table . '：' . $count . ' 筆';
+                }
+            }
+
+            if ($dependencies !== []) {
+                $stmt = db()->prepare('UPDATE lantern_types SET is_active = 0 WHERE type_id = ?');
+                $stmt->execute([$typeId]);
+
+                audit_log($adminId, 'admin_lantern_type_archive', 'lantern_types', (string) $typeId, $before, [
+                    'is_active' => 0,
+                    'dependencies' => $dependencies,
+                ]);
+                set_flash('此燈種已有關聯資料，已改為封存停用，前台不會再顯示。歷史訂單仍會保留原點燈紀錄。');
+                redirect('lantern_types.php');
+            } else {
+                $stmt = db()->prepare('DELETE FROM lantern_types WHERE type_id = ?');
+                $stmt->execute([$typeId]);
+
+                audit_log($adminId, 'admin_lantern_type_delete', 'lantern_types', (string) $typeId, $before, null);
+                set_flash('燈種已刪除。');
+                redirect('lantern_types.php');
+            }
+        }
+    }
 }
 
 $editType = null;
@@ -381,6 +429,12 @@ $lanternTypes = $stmt->fetchAll();
                                             <input type="hidden" name="type_id" value="<?= (int) $type['type_id'] ?>">
                                             <input type="hidden" name="is_active" value="<?= (int) $type['is_active'] === 1 ? 0 : 1 ?>">
                                             <button class="link-button" type="submit"><?= (int) $type['is_active'] === 1 ? '停用' : '啟用' ?></button>
+                                        </form>
+                                        <form method="post" action="lantern_types.php" onsubmit="return confirm('確定要刪除此燈種？已有關聯資料時系統會拒絕刪除。');">
+                                            <?= csrf_field() ?>
+                                            <input type="hidden" name="action" value="delete_lantern_type">
+                                            <input type="hidden" name="type_id" value="<?= (int) $type['type_id'] ?>">
+                                            <button class="link-button danger" type="submit">刪除</button>
                                         </form>
                                     </div>
                                 </td>

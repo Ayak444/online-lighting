@@ -15,6 +15,7 @@ function admin_nav(): string
         ['dashboard.php', '總覽'],
         ['lantern_types.php', '燈種'],
         ['lamp_positions.php', '燈位'],
+        ['lamp_wall_editor.php', '燈牆編輯'],
         ['orders.php', '訂單'],
         ['service_periods.php', '年度燈期'],
         ['annual_flow_rules.php', '流年規則'],
@@ -252,12 +253,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     return (int) $row['position_id'];
                 }, $stmt->fetchAll());
 
-                if ($positionIds !== []) {
-                    $placeholders = implode(',', array_fill(0, count($positionIds), '?'));
-                    $stmt = $pdo->prepare("UPDATE lamp_positions SET status = 'available', occupied_until = NULL WHERE position_id IN ($placeholders)");
-                    $stmt->execute($positionIds);
-                }
-
                 $stmt = $pdo->prepare(
                     'UPDATE lamp_reservations lr
                      INNER JOIN order_items oi ON oi.detail_id = lr.order_item_id
@@ -274,20 +269,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 );
                 $stmt->execute([$orderId]);
 
+                if ($positionIds !== []) {
+                    $placeholders = implode(',', array_fill(0, count($positionIds), '?'));
+                    $stmt = $pdo->prepare("UPDATE lamp_positions SET status = 'available', occupied_until = NULL WHERE position_id IN ($placeholders)");
+                    $stmt->execute($positionIds);
+                }
+
                 $stmt = $pdo->prepare(
                     'UPDATE orders
-                     SET review_status = "rejected", order_status = "cancelled", reviewed_at = NOW()
+                     SET review_status = "rejected", 
+                         order_status = "cancelled", 
+                         payment_status = CASE WHEN payment_status = "paid" THEN "refunded" ELSE payment_status END,
+                         reviewed_at = NOW()
                      WHERE order_id = ?'
                 );
                 $stmt->execute([$orderId]);
+
+                $isRefund = $order['payment_status'] === 'paid';
+                $notifyTitle = $isRefund ? '點燈已取消並退款' : '訂單已取消 / 審核未通過';
+                $notifyContent = $isRefund 
+                    ? '您的訂單 ' . $order['order_number'] . ' 已為您取消點燈並安排後續退款，如需協助請聯絡廟方。'
+                    : '您的訂單 ' . $order['order_number'] . ' 未通過審核或已取消，如需協助請聯絡廟方。';
 
                 create_order_notification(
                     $pdo,
                     (int) $order['user_id'],
                     $orderId,
                     null,
-                    '訂單審核未通過',
-                    '您的訂單 ' . $order['order_number'] . ' 未通過審核，如需協助請透過問題回饋聯絡。'
+                    $notifyTitle,
+                    $notifyContent
                 );
 
                 audit_log($adminId, 'admin_order_reject', 'orders', (string) $orderId, $order, [
@@ -641,7 +651,7 @@ foreach ($stmt->fetchAll() as $position) {
                     $isFocused = $focusOrderId === $orderId;
                     $canConfirmPayment = $order['payment_status'] === 'unpaid' && $order['order_status'] !== 'cancelled';
                     $canApprove = $order['payment_status'] === 'paid' && $order['review_status'] === 'pending' && $order['order_status'] !== 'cancelled';
-                    $canReject = !in_array($order['order_status'], ['cancelled', 'completed'], true) && $order['review_status'] !== 'rejected';
+                    $canReject = $order['order_status'] !== 'cancelled' && $order['review_status'] !== 'rejected';
                     $canComplete = $order['order_status'] === 'assigned';
                     ?>
                     <section class="panel order-card <?= $isFocused ? 'highlight-panel' : '' ?>">
@@ -723,7 +733,12 @@ foreach ($stmt->fetchAll() as $position) {
                                         <tr>
                                             <td><?= e(payment_method_label($payment['payment_method'])) ?></td>
                                             <td><?= e(payment_record_status_label($payment['payment_status'])) ?></td>
-                                            <td><?= e($payment['transaction_no']) ?></td>
+                                            <td>
+                                                <?= e($payment['transaction_no']) ?>
+                                                <?php if (!empty($payment['payer_name'])): ?>
+                                                    <p class="helper-text">匯款人：<?= e($payment['payer_name']) ?></p>
+                                                <?php endif; ?>
+                                            </td>
                                             <td>NT$ <?= e(number_format((float) $payment['amount'])) ?></td>
                                             <td><?= e($payment['paid_at'] ?? '尚未付款') ?></td>
                                         </tr>

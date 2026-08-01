@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
+require_once __DIR__ . '/../config/renewal_notifications.php';
 
 $user = require_login('login.php');
 $userId = (int) $user['user_id'];
@@ -15,13 +16,21 @@ function load_cart_items(int $cartId): array
     expire_lamp_reservations();
 
     $stmt = db()->prepare(
-        'SELECT ci.cart_item_id, ci.prayer_wish, lt.type_id, lt.name AS lantern_name, lt.price,
+        'SELECT ci.cart_item_id, ci.prayer_wish,
+                ci.target_period_id, ci.renewal_source_detail_id, ci.preferred_position_id,
+                lt.type_id, lt.name AS lantern_name, lt.price,
                 d.dependent_id, d.name AS dependent_name, d.birthday, d.zodiac,
+                tsp.service_year AS target_service_year,
+                tsp.blessing_start_date AS target_blessing_start_date,
+                tsp.blessing_end_date AS target_blessing_end_date,
+                pp.position_code AS preferred_position_code,
                 lr.reservation_id, lr.status AS reservation_status, lr.expires_at AS reserved_until,
                 rp.position_code AS reserved_position_code
          FROM cart_items ci
          INNER JOIN lantern_types lt ON lt.type_id = ci.type_id
          INNER JOIN dependents d ON d.dependent_id = ci.dependent_id
+         LEFT JOIN lamp_service_periods tsp ON tsp.period_id = ci.target_period_id
+         LEFT JOIN lamp_positions pp ON pp.position_id = ci.preferred_position_id
          LEFT JOIN lamp_reservations lr ON lr.reservation_id = (
              SELECT lr2.reservation_id
              FROM lamp_reservations lr2
@@ -45,24 +54,53 @@ function available_count_by_type(array $typeIds): array
     return available_lamp_counts_by_type($typeIds);
 }
 
-function validate_cart_stock(array $cartItems): array
+function cart_target_period(array $cartItems, ?array $activePeriod): ?array
+{
+    $targetPeriodIds = [];
+    foreach ($cartItems as $item) {
+        if (!empty($item['target_period_id'])) {
+            $targetPeriodIds[(int) $item['target_period_id']] = true;
+        }
+    }
+
+    if ($targetPeriodIds === []) {
+        return $activePeriod;
+    }
+
+    if (count($targetPeriodIds) > 1) {
+        throw new RuntimeException('購物車內含不同年度的續點項目，請分開結帳。');
+    }
+
+    $periodId = (int) array_key_first($targetPeriodIds);
+    $period = lamp_service_period_by_id($periodId);
+    if ($period === null) {
+        throw new RuntimeException('找不到續點目標年度燈期，請重新加入購物車。');
+    }
+
+    return $period;
+}
+
+function validate_cart_stock(array $cartItems, ?array $targetPeriod): array
 {
     $quantityByType = [];
     $nameByType = [];
 
     foreach ($cartItems as $item) {
+        if (!empty($item['preferred_position_id'])) {
+            continue;
+        }
         $typeId = (int) $item['type_id'];
         $quantityByType[$typeId] = ($quantityByType[$typeId] ?? 0) + 1;
         $nameByType[$typeId] = $item['lantern_name'];
     }
 
-    $availableByType = available_count_by_type(array_keys($quantityByType));
+    $stockBreakdownByType = lamp_stock_breakdown_by_type_for_period(array_keys($quantityByType), $targetPeriod);
     $stockErrors = [];
 
     foreach ($quantityByType as $typeId => $quantity) {
-        $available = $availableByType[$typeId] ?? 0;
+        $available = (int) ($stockBreakdownByType[$typeId]['available_count'] ?? 0);
         if ($quantity > $available) {
-            $stockErrors[] = $nameByType[$typeId] . ' 剩餘燈位不足，目前剩餘 ' . $available . ' 位。';
+            $stockErrors[] = lamp_stock_unavailable_message_for_period($typeId, $nameByType[$typeId], $quantity, $targetPeriod);
         }
     }
 
@@ -102,7 +140,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($errors === [] && $action === 'refresh_reservation') {
         $cartItemId = (int) ($_POST['cart_item_id'] ?? 0);
         $stmt = db()->prepare(
-            'SELECT ci.cart_item_id, ci.type_id
+            'SELECT ci.cart_item_id, ci.type_id, ci.target_period_id, ci.preferred_position_id
              FROM cart_items ci
              WHERE ci.cart_item_id = ? AND ci.cart_id = ?
              LIMIT 1'
@@ -112,14 +150,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if (!$cartItem) {
             $errors[] = '找不到要重新保留的購物車項目。';
+        } elseif (!empty($cartItem['preferred_position_id'])) {
+            $errors[] = '此續點項目會沿用原燈位，不需要重新保留燈位。';
         } else {
             $pdo = db();
             $pdo->beginTransaction();
 
             try {
-                $reservation = refresh_lamp_reservation_for_cart_item($pdo, $cartItemId, (int) $cartItem['type_id'], $userId);
+                $targetPeriod = !empty($cartItem['target_period_id']) ? lamp_service_period_by_id((int) $cartItem['target_period_id']) : $activePeriod;
+                $reservation = reserve_lamp_position_for_cart_item_period($pdo, $cartItemId, (int) $cartItem['type_id'], $userId, $targetPeriod);
                 if ($reservation === null) {
-                    throw new RuntimeException('此燈種目前沒有可保留的燈位，請稍後再試或改選其他燈種。');
+                    $stmt = $pdo->prepare(
+                        'SELECT name
+                         FROM lantern_types
+                         WHERE type_id = ?
+                         LIMIT 1'
+                    );
+                    $stmt->execute([(int) $cartItem['type_id']]);
+                    $lanternName = (string) ($stmt->fetchColumn() ?: '此燈種');
+                    throw new RuntimeException(lamp_stock_unavailable_message((int) $cartItem['type_id'], $lanternName));
                 }
 
                 $pdo->commit();
@@ -137,6 +186,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($errors === [] && $action === 'checkout') {
         $cartItems = load_cart_items($cartId);
+        $checkoutPeriod = null;
         $paymentMethod = trim((string) ($_POST['payment_method'] ?? 'bank_transfer'));
         $allowedPaymentMethods = ['bank_transfer', 'credit_card', 'mobile_payment', 'convenience_store'];
 
@@ -148,8 +198,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $errors[] = '購物車目前沒有項目。';
         }
 
-        if ($activePeriod === null) {
-            $errors[] = '目前尚未設定可報名的年度燈期，請稍後再試。';
+        if ($errors === []) {
+            try {
+                $checkoutPeriod = cart_target_period($cartItems, $activePeriod);
+            } catch (RuntimeException $runtimeException) {
+                $errors[] = $runtimeException->getMessage();
+            }
+        }
+
+        if ($checkoutPeriod === null) {
+            $errors[] = '目前尚未設定可報名或可續點的年度燈期，請稍後再試。';
         }
 
         if ($errors === []) {
@@ -157,11 +215,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->beginTransaction();
 
             try {
+                foreach (validate_cart_stock($cartItems, $checkoutPeriod) as $stockError) {
+                    throw new RuntimeException($stockError);
+                }
+
                 $reservationsByCartItem = [];
                 foreach ($cartItems as $item) {
-                    $reservation = reserve_lamp_position_for_cart_item($pdo, (int) $item['cart_item_id'], (int) $item['type_id'], $userId);
+                    if (!empty($item['preferred_position_id'])) {
+                        if (!renewal_source_position_valid(
+                            $pdo,
+                            (int) $item['renewal_source_detail_id'],
+                            (int) $item['preferred_position_id'],
+                            (int) $item['type_id'],
+                            (int) $item['dependent_id'],
+                            $userId
+                        )) {
+                            throw new RuntimeException($item['lantern_name'] . ' 的原燈位已無法續點，請移除此項目後重新加入。');
+                        }
+                        continue;
+                    }
+
+                    $reservation = reserve_lamp_position_for_cart_item_period($pdo, (int) $item['cart_item_id'], (int) $item['type_id'], $userId, $checkoutPeriod);
                     if ($reservation === null) {
-                        throw new RuntimeException($item['lantern_name'] . ' 目前沒有可保留的燈位，請移除或改選其他燈種。');
+                        throw new RuntimeException(lamp_stock_unavailable_message_for_period((int) $item['type_id'], (string) $item['lantern_name'], 1, $checkoutPeriod));
                     }
 
                     $reservationsByCartItem[(int) $item['cart_item_id']] = $reservation;
@@ -180,16 +256,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt->execute([
                     $orderNumber,
                     $userId,
-                    (int) $activePeriod['period_id'],
-                    (int) $activePeriod['service_year'],
+                    (int) $checkoutPeriod['period_id'],
+                    (int) $checkoutPeriod['service_year'],
                     $totalAmount,
                     trim((string) ($_POST['note'] ?? '')) ?: null,
                 ]);
                 $orderId = (int) $pdo->lastInsertId();
 
                 $stmt = $pdo->prepare(
-                    'INSERT INTO order_items (order_id, type_id, dependent_id, lantern_name_snapshot, dependent_name_snapshot, price_snapshot, blessing_start_date, blessing_end_date)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                    'INSERT INTO order_items (
+                        order_id,
+                        type_id,
+                        dependent_id,
+                        position_id,
+                        lantern_name_snapshot,
+                        dependent_name_snapshot,
+                        price_snapshot,
+                        renewal_source_detail_id,
+                        blessing_start_date,
+                        blessing_end_date
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                 );
 
                 foreach ($cartItems as $item) {
@@ -197,11 +283,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $orderId,
                         (int) $item['type_id'],
                         (int) $item['dependent_id'],
+                        !empty($item['preferred_position_id']) ? (int) $item['preferred_position_id'] : null,
                         $item['lantern_name'],
                         $item['dependent_name'],
                         (float) $item['price'],
-                        null,
-                        $activePeriod['blessing_end_date'],
+                        !empty($item['renewal_source_detail_id']) ? (int) $item['renewal_source_detail_id'] : null,
+                        $checkoutPeriod['blessing_start_date'],
+                        $checkoutPeriod['blessing_end_date'],
                     ]);
 
                     $detailId = (int) $pdo->lastInsertId();
@@ -230,8 +318,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'source' => 'frontend_checkout',
                         'payment_method' => $paymentMethod,
                         'order_number' => $orderNumber,
-                        'service_year' => (int) $activePeriod['service_year'],
-                        'blessing_end_date' => $activePeriod['blessing_end_date'],
+                        'service_year' => (int) $checkoutPeriod['service_year'],
+                        'blessing_end_date' => $checkoutPeriod['blessing_end_date'],
                     ], JSON_UNESCAPED_UNICODE),
                 ]);
 
@@ -243,7 +331,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $userId,
                     $orderId,
                     '訂單已建立',
-                    '您的訂單 ' . $orderNumber . ' 已建立，付款方式為 ' . payment_method_label($paymentMethod) . '。本年度燈期到期日為 ' . $activePeriod['blessing_end_date'] . '，請等待後台審核。',
+                    '您的訂單 ' . $orderNumber . ' 已建立，付款方式為 ' . payment_method_label($paymentMethod) . '。燈期到期日為 ' . $checkoutPeriod['blessing_end_date'] . '，請等待後台審核。',
                 ]);
 
                 $stmt = $pdo->prepare('DELETE FROM cart_items WHERE cart_id = ?');
@@ -253,27 +341,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'order_number' => $orderNumber,
                     'total_amount' => $totalAmount,
                     'payment_method' => $paymentMethod,
-                    'service_year' => (int) $activePeriod['service_year'],
-                    'blessing_end_date' => $activePeriod['blessing_end_date'],
+                    'service_year' => (int) $checkoutPeriod['service_year'],
+                    'blessing_end_date' => $checkoutPeriod['blessing_end_date'],
                     'items' => count($cartItems),
                 ]);
+                ensure_renewal_reminder_job_for_period($checkoutPeriod, null);
 
                 $pdo->commit();
                 set_flash('訂單已建立，請依付款方式完成付款，並等待後台審核與安燈。');
                 redirect('orders.php?order_id=' . $orderId);
             } catch (Throwable $throwable) {
                 $pdo->rollBack();
-                $errors[] = '建立訂單失敗，請稍後再試。';
+                $errors[] = $throwable instanceof RuntimeException ? $throwable->getMessage() : '建立訂單失敗，請稍後再試。';
             }
         }
     }
 }
 
 $cartItems = load_cart_items($cartId);
+$displayPeriod = null;
+try {
+    $displayPeriod = cart_target_period($cartItems, $activePeriod);
+} catch (RuntimeException) {
+    $displayPeriod = $activePeriod;
+}
 $typeIds = array_values(array_unique(array_map(static function (array $item): int {
     return (int) $item['type_id'];
 }, $cartItems)));
-$availableByType = available_count_by_type($typeIds);
+$stockBreakdownByType = lamp_stock_breakdown_by_type_for_period($typeIds, $displayPeriod);
+$availableByType = [];
+foreach ($stockBreakdownByType as $typeId => $breakdown) {
+    $availableByType[(int) $typeId] = (int) ($breakdown['available_count'] ?? 0);
+}
 $totalAmount = array_reduce($cartItems, static function (float $sum, array $item): float {
     return $sum + (float) $item['price'];
 }, 0.0);
@@ -314,11 +413,11 @@ $totalAmount = array_reduce($cartItems, static function (float $sum, array $item
             <div class="section-heading">
                 <div>
                     <h2>年度燈期</h2>
-                    <?php if ($activePeriod): ?>
+                    <?php if ($displayPeriod): ?>
                         <p class="helper-text">
-                            <?= e((string) $activePeriod['service_year']) ?> 年度點燈共用燈期，
-                            開燈日 <?= e($activePeriod['blessing_start_date']) ?>，
-                            謝燈日 <?= e($activePeriod['blessing_end_date']) ?>。
+                            <?= e((string) $displayPeriod['service_year']) ?> 年度點燈共用燈期，
+                            開燈日 <?= e($displayPeriod['blessing_start_date']) ?>，
+                            謝燈日 <?= e($displayPeriod['blessing_end_date']) ?>。
                         </p>
                     <?php else: ?>
                         <p class="helper-text">目前尚未啟用年度燈期，暫時無法結帳。</p>
@@ -372,7 +471,13 @@ $totalAmount = array_reduce($cartItems, static function (float $sum, array $item
                                     <td><?= e($item['zodiac']) ?></td>
                                     <td><?= e($item['prayer_wish']) ?></td>
                                     <td>
-                                        <?php if ($reservationActive): ?>
+                                        <?php if (!empty($item['preferred_position_id'])): ?>
+                                            <div class="reservation-state active">
+                                                <strong>沿用原燈位 <?= e($item['preferred_position_code'] ?? '') ?></strong>
+                                                <span>續點至 <?= e((string) ($item['target_blessing_end_date'] ?? '-')) ?></span>
+                                                <small>不需要重新保留今年燈位</small>
+                                            </div>
+                                        <?php elseif ($reservationActive): ?>
                                             <div class="reservation-state active">
                                                 <strong>已保留 <?= e($item['reserved_position_code'] ?? '') ?></strong>
                                                 <span>至 <?= e($item['reserved_until']) ?></span>

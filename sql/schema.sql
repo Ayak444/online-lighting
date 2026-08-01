@@ -22,6 +22,7 @@ DROP TABLE IF EXISTS lamp_positions;
 DROP TABLE IF EXISTS lantern_types;
 DROP TABLE IF EXISTS dependents;
 DROP TABLE IF EXISTS phone_login_codes;
+DROP TABLE IF EXISTS password_resets;
 DROP TABLE IF EXISTS oauth_states;
 DROP TABLE IF EXISTS auth_identities;
 DROP TABLE IF EXISTS user_roles;
@@ -118,6 +119,22 @@ CREATE TABLE phone_login_codes (
         ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE password_resets (
+    reset_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id BIGINT UNSIGNED NOT NULL,
+    token_hash CHAR(64) NOT NULL,
+    expires_at DATETIME NOT NULL,
+    used_at DATETIME NULL,
+    requested_ip VARCHAR(45) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (reset_id),
+    UNIQUE KEY uq_password_resets_token_hash (token_hash),
+    KEY idx_password_resets_user_expires (user_id, expires_at, used_at),
+    CONSTRAINT fk_password_resets_user
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE user_roles (
     user_id BIGINT UNSIGNED NOT NULL,
     role_id TINYINT UNSIGNED NOT NULL,
@@ -182,7 +199,7 @@ CREATE TABLE lamp_positions (
     area VARCHAR(50) NULL,
     row_no INT NULL,
     col_no INT NULL,
-    status ENUM('available', 'occupied', 'maintenance') NOT NULL DEFAULT 'available',
+    status ENUM('available', 'occupied', 'maintenance', 'retired') NOT NULL DEFAULT 'available',
     occupied_until DATE NULL,
     note VARCHAR(255) NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -269,12 +286,18 @@ CREATE TABLE cart_items (
     cart_id BIGINT UNSIGNED NOT NULL,
     type_id BIGINT UNSIGNED NOT NULL,
     dependent_id BIGINT UNSIGNED NOT NULL,
+    target_period_id BIGINT UNSIGNED NULL,
+    renewal_source_detail_id BIGINT UNSIGNED NULL,
+    preferred_position_id BIGINT UNSIGNED NULL,
     prayer_wish VARCHAR(255) NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (cart_item_id),
     KEY idx_cart_items_cart_id (cart_id),
     KEY idx_cart_items_type_id (type_id),
     KEY idx_cart_items_dependent_id (dependent_id),
+    KEY idx_cart_items_target_period (target_period_id),
+    KEY idx_cart_items_renewal_source (renewal_source_detail_id),
+    KEY idx_cart_items_preferred_position (preferred_position_id),
     CONSTRAINT fk_cart_items_cart
         FOREIGN KEY (cart_id) REFERENCES carts (cart_id)
         ON DELETE CASCADE ON UPDATE CASCADE,
@@ -283,7 +306,13 @@ CREATE TABLE cart_items (
         ON DELETE RESTRICT ON UPDATE CASCADE,
     CONSTRAINT fk_cart_items_dependent
         FOREIGN KEY (dependent_id) REFERENCES dependents (dependent_id)
-        ON DELETE CASCADE ON UPDATE CASCADE
+        ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_cart_items_target_period
+        FOREIGN KEY (target_period_id) REFERENCES lamp_service_periods (period_id)
+        ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_cart_items_preferred_position
+        FOREIGN KEY (preferred_position_id) REFERENCES lamp_positions (position_id)
+        ON DELETE SET NULL ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE orders (
@@ -324,6 +353,7 @@ CREATE TABLE order_items (
     lantern_name_snapshot VARCHAR(100) NOT NULL,
     dependent_name_snapshot VARCHAR(100) NOT NULL,
     price_snapshot DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+    renewal_source_detail_id BIGINT UNSIGNED NULL,
     blessing_start_date DATE NULL,
     blessing_end_date DATE NULL,
     assigned_at DATETIME NULL,
@@ -334,6 +364,7 @@ CREATE TABLE order_items (
     KEY idx_order_items_type_id (type_id),
     KEY idx_order_items_dependent_id (dependent_id),
     KEY idx_order_items_position_id (position_id),
+    KEY idx_order_items_renewal_source (renewal_source_detail_id),
     CONSTRAINT fk_order_items_order
         FOREIGN KEY (order_id) REFERENCES orders (order_id)
         ON DELETE CASCADE ON UPDATE CASCADE,
@@ -345,6 +376,9 @@ CREATE TABLE order_items (
         ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT fk_order_items_position
         FOREIGN KEY (position_id) REFERENCES lamp_positions (position_id)
+        ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT fk_order_items_renewal_source
+        FOREIGN KEY (renewal_source_detail_id) REFERENCES order_items (detail_id)
         ON DELETE SET NULL ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

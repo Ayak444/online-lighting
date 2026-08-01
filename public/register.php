@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../config/auth.php';
 require_once __DIR__ . '/../config/birth_profile.php';
-require_once __DIR__ . '/../config/external_auth.php';
+
 
 start_app_session();
 
@@ -169,15 +169,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
         <?php endif; ?>
 
-        <section class="panel section-gap">
-            <h2>快速註冊</h2>
-            <?php if (auth_provider_is_configured('google')): ?>
-                <p class="helper-text">第一次使用 Google 會自動建立會員帳號，之後可直接用同一個 Google 帳號登入。</p>
-                <a class="button" href="oauth_start.php?provider=google">使用 Google 一鍵註冊</a>
-            <?php else: ?>
-                <p class="helper-text">Google 一鍵註冊功能已完成程式串接，尚未填入 Google OAuth Client ID / Secret。</p>
-            <?php endif; ?>
-        </section>
 
         <form class="form" method="post" action="register.php">
             <?= csrf_field() ?>

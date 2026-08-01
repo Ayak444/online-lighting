@@ -2,6 +2,8 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
+require_once __DIR__ . '/../config/integrations.php';
+require_once __DIR__ . '/../config/notification_delivery.php';
 
 function notification_already_exists(int $jobId, int $userId, string $subject): bool
 {
@@ -18,10 +20,10 @@ function notification_already_exists(int $jobId, int $userId, string $subject): 
     return (bool) $stmt->fetchColumn();
 }
 
-function create_job_notification(array $job, int $userId, string $subject, string $content): bool
+function create_job_notification(array $job, int $userId, string $subject, string $content): ?int
 {
     if (notification_already_exists((int) $job['job_id'], $userId, $subject)) {
-        return false;
+        return null;
     }
 
     $stmt = db()->prepare(
@@ -42,7 +44,7 @@ function create_job_notification(array $job, int $userId, string $subject, strin
         $content,
     ]);
 
-    return true;
+    return (int) db()->lastInsertId();
 }
 
 function expiration_reminder_recipients(array $period): array
@@ -91,6 +93,8 @@ $results = [];
 
 foreach ($jobs as $job) {
     $createdCount = 0;
+    $sentCount = 0;
+    $failedCount = 0;
     $subject = trim((string) ($job['subject'] ?? ''));
     $content = trim((string) ($job['content'] ?? ''));
 
@@ -102,18 +106,29 @@ foreach ($jobs as $job) {
         }
 
         if ($subject === '') {
-            $subject = '年度點燈即將謝燈';
+            $subject = '年度點燈續點提醒';
         }
 
         if ($content === '') {
-            $content = '您的 ' . $period['service_year'] . ' 年度點燈服務將於 ' . $period['blessing_end_date'] . ' 謝燈，敬請留意後續公告。';
+            global $integrationConfig;
+            $baseUrl = rtrim((string) ($integrationConfig['app']['public_base_url'] ?? ''), '/');
+            $renewalUrl = $baseUrl === '' ? 'renewal_advisor.php' : $baseUrl . '/renewal_advisor.php';
+            $content = '您的 ' . $period['service_year'] . ' 年度點燈服務將於 ' . $period['blessing_end_date'] . ' 到期。請登入系統使用智慧續點功能，確認祈福對象資料後辦理續點：' . $renewalUrl;
         } else {
-            $content .= ' 本年度謝燈日為 ' . $period['blessing_end_date'] . '。';
+            $content .= ' 本年度點燈到期日為 ' . $period['blessing_end_date'] . '。';
         }
 
         foreach (expiration_reminder_recipients($period) as $userId) {
-            if (create_job_notification($job, $userId, $subject, $content)) {
+            $notificationId = create_job_notification($job, $userId, $subject, $content);
+            if ($notificationId !== null) {
                 $createdCount++;
+                notification_process_by_id($notificationId, true, null);
+                $delivery = notification_latest_delivery($notificationId);
+                if (($delivery['delivery_status'] ?? '') === 'sent') {
+                    $sentCount++;
+                } else {
+                    $failedCount++;
+                }
             }
         }
     } else {
@@ -126,8 +141,16 @@ foreach ($jobs as $job) {
         }
 
         foreach (broadcast_recipients() as $userId) {
-            if (create_job_notification($job, $userId, $subject, $content)) {
+            $notificationId = create_job_notification($job, $userId, $subject, $content);
+            if ($notificationId !== null) {
                 $createdCount++;
+                notification_process_by_id($notificationId, true, null);
+                $delivery = notification_latest_delivery($notificationId);
+                if (($delivery['delivery_status'] ?? '') === 'sent') {
+                    $sentCount++;
+                } else {
+                    $failedCount++;
+                }
             }
         }
     }
@@ -144,10 +167,12 @@ foreach ($jobs as $job) {
 
     audit_log(null, 'system_scheduled_job_run', 'scheduled_jobs', (string) $job['job_id'], $before, [
         'created_notifications' => $createdCount,
+        'sent_notifications' => $sentCount,
+        'failed_notifications' => $failedCount,
         'job_type' => $job['job_type'],
     ]);
 
-    $results[] = 'Job #' . $job['job_id'] . ' completed, notifications created: ' . $createdCount . '.';
+    $results[] = 'Job #' . $job['job_id'] . ' completed, notifications created: ' . $createdCount . ', sent: ' . $sentCount . ', failed: ' . $failedCount . '.';
 }
 
 if ($results === []) {

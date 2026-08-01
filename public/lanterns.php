@@ -59,7 +59,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $cartItemId = (int) $pdo->lastInsertId();
             $reservation = reserve_lamp_position_for_cart_item($pdo, $cartItemId, $typeId, $userId);
             if ($reservation === null) {
-                throw new RuntimeException('此燈種目前沒有可保留的燈位，請改選其他燈種或稍後再試。');
+                throw new RuntimeException(lamp_stock_unavailable_message($typeId, (string) $lantern['name']));
             }
 
             audit_log($userId, 'cart_item_create', 'cart_items', (string) $cartItemId, null, [
@@ -71,8 +71,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $pdo->commit();
-            set_flash('已加入購物車，並為您保留燈位 1 小時。');
-            redirect('cart.php');
+            set_flash('已成功加入購物車，燈位已為您保留 1 小時。您可以繼續選擇其他燈種，或前往購物車確認。');
+            redirect('lanterns.php?' . http_build_query(['dependent_id' => $dependentId]));
         } catch (Throwable $throwable) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
@@ -91,9 +91,12 @@ $stmt = db()->query(
      ORDER BY lt.sort_order, lt.type_id'
 );
 $lanterns = $stmt->fetchAll();
-$availableCounts = available_lamp_counts_by_type(array_map(static fn (array $lantern): int => (int) $lantern['type_id'], $lanterns));
+$lanternTypeIds = array_map(static fn (array $lantern): int => (int) $lantern['type_id'], $lanterns);
+$availableCounts = available_lamp_counts_by_type($lanternTypeIds);
+$stockBreakdownByType = lamp_stock_breakdown_by_type($lanternTypeIds);
 foreach ($lanterns as &$lantern) {
     $lantern['available_count'] = $availableCounts[(int) $lantern['type_id']] ?? 0;
+    $lantern['stock_breakdown'] = $stockBreakdownByType[(int) $lantern['type_id']] ?? null;
 }
 unset($lantern);
 
@@ -173,6 +176,47 @@ function dependent_birth_profile_missing(array $dependent): array
 
     return $missing;
 }
+
+function load_lantern_cart_preview_items(int $userId): array
+{
+    expire_lamp_reservations();
+
+    $stmt = db()->prepare(
+        'SELECT ci.cart_item_id, ci.prayer_wish, lt.type_id, lt.name AS lantern_name,
+                lt.blessing_description, lt.recommended_for, lt.price,
+                d.dependent_id, d.name AS dependent_name,
+                lr.status AS reservation_status, lr.expires_at AS reserved_until,
+                rp.position_code AS reserved_position_code
+         FROM carts c
+         INNER JOIN cart_items ci ON ci.cart_id = c.cart_id
+         INNER JOIN lantern_types lt ON lt.type_id = ci.type_id
+         INNER JOIN dependents d ON d.dependent_id = ci.dependent_id
+         LEFT JOIN lamp_reservations lr ON lr.reservation_id = (
+             SELECT lr2.reservation_id
+             FROM lamp_reservations lr2
+             WHERE lr2.cart_item_id = ci.cart_item_id
+             ORDER BY
+                 CASE WHEN lr2.status = "active" AND lr2.expires_at > NOW() THEN 0 ELSE 1 END,
+                 lr2.reservation_id DESC
+             LIMIT 1
+         )
+         LEFT JOIN lamp_positions rp ON rp.position_id = lr.position_id
+         WHERE c.user_id = ?
+         ORDER BY ci.created_at DESC, ci.cart_item_id DESC'
+    );
+    $stmt->execute([$userId]);
+
+    return $stmt->fetchAll();
+}
+
+$cartPreviewItems = [];
+$cartPreviewTotal = 0.0;
+if ($user !== null) {
+    $cartPreviewItems = load_lantern_cart_preview_items((int) $user['user_id']);
+    foreach ($cartPreviewItems as $cartPreviewItem) {
+        $cartPreviewTotal += (float) $cartPreviewItem['price'];
+    }
+}
 ?>
 <!doctype html>
 <html lang="zh-Hant">
@@ -192,7 +236,10 @@ function dependent_birth_profile_missing(array $dependent): array
         <h1>選擇祈福對象與推薦燈種</h1>
 
         <?php if ($flash): ?>
-            <div class="alert success"><p><?= e($flash) ?></p></div>
+            <div class="alert success action-alert">
+                <p><?= e($flash) ?></p>
+                <a class="button secondary" href="cart.php">前往購物車</a>
+            </div>
         <?php endif; ?>
 
         <?php if ($errors !== []): ?>
@@ -267,6 +314,59 @@ function dependent_birth_profile_missing(array $dependent): array
             </section>
         <?php endif; ?>
 
+        <?php if ($user !== null): ?>
+            <section class="panel section-gap" id="selected-lanterns">
+                <div class="section-heading">
+                    <div>
+                        <h2>目前已選燈種</h2>
+                        <p class="helper-text">可先連續加入多盞燈，燈位會保留 1 小時；最後再到購物車統一確認。</p>
+                    </div>
+                    <a class="button" href="cart.php">前往購物車</a>
+                </div>
+
+                <?php if ($cartPreviewItems === []): ?>
+                    <p class="helper-text">目前尚未加入任何燈種。</p>
+                <?php else: ?>
+                    <div class="cart-preview-list">
+                        <?php foreach ($cartPreviewItems as $item): ?>
+                            <?php
+                            $reservationActive = ($item['reservation_status'] ?? '') === 'active'
+                                && !empty($item['reserved_until'])
+                                && strtotime((string) $item['reserved_until']) > time();
+                            ?>
+                            <article class="cart-preview-item">
+                                <div>
+                                    <h3><?= e($item['lantern_name']) ?></h3>
+                                    <p class="cart-preview-meta">
+                                        <?= e($item['dependent_name']) ?>
+                                        <?php if (!empty($item['prayer_wish'])): ?>
+                                            <span>願望：<?= e($item['prayer_wish']) ?></span>
+                                        <?php endif; ?>
+                                    </p>
+                                    <p class="cart-preview-effect"><?= e($item['blessing_description']) ?></p>
+                                    <p class="helper-text">適合：<?= e($item['recommended_for']) ?></p>
+                                </div>
+                                <div class="cart-preview-status">
+                                    <strong>NT$ <?= e(number_format((float) $item['price'])) ?></strong>
+                                    <?php if ($reservationActive): ?>
+                                        <span>保留 <?= e($item['reserved_position_code'] ?? '') ?></span>
+                                        <small>剩 <?= e(reservation_time_left_text($item['reserved_until'])) ?></small>
+                                    <?php else: ?>
+                                        <span class="expired-text">保留已過期</span>
+                                        <small>可到購物車重新保留</small>
+                                    <?php endif; ?>
+                                </div>
+                            </article>
+                        <?php endforeach; ?>
+                    </div>
+                    <div class="cart-preview-total">
+                        <span>共 <?= count($cartPreviewItems) ?> 盞</span>
+                        <strong>目前小計 NT$ <?= e(number_format($cartPreviewTotal)) ?></strong>
+                    </div>
+                <?php endif; ?>
+            </section>
+        <?php endif; ?>
+
         <h2 class="section-title">2. 選擇燈種</h2>
         <div class="card-grid lantern-grid">
             <?php foreach ($lanterns as $lantern): ?>
@@ -274,9 +374,13 @@ function dependent_birth_profile_missing(array $dependent): array
                 $typeId = (int) $lantern['type_id'];
                 $isRecommended = isset($recommendationsByType[$typeId]);
                 $generalLabel = lantern_general_choice_label((string) $lantern['slug']);
+                $isSoldOut = (int) $lantern['available_count'] <= 0;
+                $stockMessage = $isSoldOut
+                    ? lamp_stock_unavailable_message($typeId, (string) $lantern['name'])
+                    : '';
                 ?>
                 <article class="feature-card lantern-card">
-                    <div class="lantern-symbol"><?= e(mb_substr($lantern['name'], 0, 1)) ?></div>
+                    <div class="lantern-symbol"><?= e(text_first_char($lantern['name'])) ?></div>
                     <div class="lantern-card-title">
                         <h2><?= e($lantern['name']) ?></h2>
                         <?php if ($isRecommended): ?>
@@ -297,6 +401,9 @@ function dependent_birth_profile_missing(array $dependent): array
                         <span>NT$ <?= e(number_format((float) $lantern['price'])) ?></span>
                         <span>剩餘 <?= (int) $lantern['available_count'] ?> 位</span>
                     </div>
+                    <?php if ($isSoldOut): ?>
+                        <p class="helper-text"><?= e($stockMessage) ?></p>
+                    <?php endif; ?>
 
                     <?php if ($isRecommended): ?>
                         <div class="recommend-reasons">
@@ -319,8 +426,8 @@ function dependent_birth_profile_missing(array $dependent): array
                                 <input type="text" name="prayer_wish" placeholder="<?= $selectedDependent ? '例如：平安順利' : '請先選擇祈福對象' ?>" <?= $selectedDependent === null ? 'disabled' : '' ?>>
                             </label>
 
-                            <button class="button" type="submit" <?= $selectedDependent === null ? 'disabled' : '' ?>>
-                                <?= $isRecommended ? '加入推薦燈種' : '加入購物車' ?>
+                            <button class="button" type="submit" <?= ($selectedDependent === null || $isSoldOut) ? 'disabled' : '' ?>>
+                                <?= $isSoldOut ? '目前滿位' : ($isRecommended ? '加入推薦燈種' : '加入購物車') ?>
                             </button>
                         </form>
                     <?php endif; ?>

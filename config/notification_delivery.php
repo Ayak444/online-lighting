@@ -236,6 +236,143 @@ function notification_mock_result(string $channel, string $recipient, string $su
     ];
 }
 
+function notification_email_address(string $email, string $name = ''): string
+{
+    $email = trim($email);
+    $name = trim($name);
+
+    if ($name === '') {
+        return $email;
+    }
+
+    return '=?UTF-8?B?' . base64_encode($name) . '?= <' . $email . '>';
+}
+
+function notification_smtp_read($socket): string
+{
+    $response = '';
+
+    while (!feof($socket)) {
+        $line = (string) fgets($socket, 515);
+        $response .= $line;
+
+        if (preg_match('/^\d{3}\s/', $line) === 1) {
+            break;
+        }
+    }
+
+    return $response;
+}
+
+function notification_smtp_command($socket, string $command, array $expectedCodes): string
+{
+    if ($command !== '') {
+        fwrite($socket, $command . "\r\n");
+    }
+
+    $response = notification_smtp_read($socket);
+    $code = (int) substr($response, 0, 3);
+
+    if (!in_array($code, $expectedCodes, true)) {
+        throw new RuntimeException('SMTP command failed: ' . trim($response));
+    }
+
+    return $response;
+}
+
+function notification_send_smtp_email(string $recipient, string $subject, string $content, array $config): array
+{
+    $host = trim((string) ($config['smtp_host'] ?? ''));
+    $port = (int) ($config['smtp_port'] ?? 587);
+    $username = trim((string) ($config['smtp_username'] ?? ''));
+    $password = (string) ($config['smtp_password'] ?? '');
+    $encryption = strtolower(trim((string) ($config['smtp_encryption'] ?? 'tls')));
+    $fromAddress = trim((string) ($config['from_address'] ?? ''));
+    $fromName = trim((string) ($config['from_name'] ?? ''));
+
+    if ($host === '' || $fromAddress === '') {
+        return [
+            'status' => 'failed',
+            'provider' => 'smtp',
+            'provider_message_id' => null,
+            'provider_response' => null,
+            'error_message' => 'SMTP host 或寄件者未設定。',
+        ];
+    }
+
+    $remote = ($encryption === 'ssl' ? 'ssl://' : '') . $host . ':' . $port;
+    $socket = @stream_socket_client($remote, $errno, $errstr, 20, STREAM_CLIENT_CONNECT);
+
+    if (!$socket) {
+        return [
+            'status' => 'failed',
+            'provider' => 'smtp',
+            'provider_message_id' => null,
+            'provider_response' => null,
+            'error_message' => 'SMTP 連線失敗：' . $errstr,
+        ];
+    }
+
+    stream_set_timeout($socket, 20);
+    $lastResponse = '';
+
+    try {
+        $lastResponse = notification_smtp_command($socket, '', [220]);
+        $lastResponse = notification_smtp_command($socket, 'EHLO ' . ($_SERVER['SERVER_NAME'] ?? 'localhost'), [250]);
+
+        if ($encryption === 'tls') {
+            $lastResponse = notification_smtp_command($socket, 'STARTTLS', [220]);
+            if (!stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+                throw new RuntimeException('SMTP STARTTLS failed.');
+            }
+            $lastResponse = notification_smtp_command($socket, 'EHLO ' . ($_SERVER['SERVER_NAME'] ?? 'localhost'), [250]);
+        }
+
+        if ($username !== '' || $password !== '') {
+            notification_smtp_command($socket, 'AUTH LOGIN', [334]);
+            notification_smtp_command($socket, base64_encode($username), [334]);
+            $lastResponse = notification_smtp_command($socket, base64_encode($password), [235]);
+        }
+
+        notification_smtp_command($socket, 'MAIL FROM:<' . $fromAddress . '>', [250]);
+        notification_smtp_command($socket, 'RCPT TO:<' . $recipient . '>', [250, 251]);
+        notification_smtp_command($socket, 'DATA', [354]);
+
+        $headers = [
+            'Date: ' . date(DATE_RFC2822),
+            'From: ' . notification_email_address($fromAddress, $fromName),
+            'To: ' . $recipient,
+            'Subject: =?UTF-8?B?' . base64_encode($subject) . '?=',
+            'MIME-Version: 1.0',
+            'Content-Type: text/plain; charset=UTF-8',
+            'Content-Transfer-Encoding: 8bit',
+        ];
+        $message = implode("\r\n", $headers) . "\r\n\r\n" . str_replace("\n.", "\n..", $content) . "\r\n.";
+        $lastResponse = notification_smtp_command($socket, $message, [250]);
+        notification_smtp_command($socket, 'QUIT', [221, 250]);
+        fclose($socket);
+
+        return [
+            'status' => 'sent',
+            'provider' => 'smtp',
+            'provider_message_id' => null,
+            'provider_response' => $lastResponse,
+            'error_message' => null,
+        ];
+    } catch (Throwable $throwable) {
+        @fwrite($socket, "QUIT\r\n");
+        @fclose($socket);
+
+        return [
+            'status' => 'failed',
+            'provider' => 'smtp',
+            'provider_message_id' => null,
+            'provider_response' => $lastResponse,
+            'error_message' => $throwable->getMessage(),
+        ];
+    }
+}
+
 function notification_send_email(string $recipient, string $subject, string $content): array
 {
     $config = notification_delivery_config('email');
@@ -243,6 +380,10 @@ function notification_send_email(string $recipient, string $subject, string $con
 
     if ($driver === 'mock') {
         return notification_mock_result('email', $recipient, $subject, $content);
+    }
+
+    if ($driver === 'smtp') {
+        return notification_send_smtp_email($recipient, $subject, $content, $config);
     }
 
     if ($driver !== 'mail') {
@@ -495,6 +636,81 @@ function notification_record_delivery(array $notification, int $attemptNo, ?stri
     $stmt->execute([$deliveryId]);
 
     return $stmt->fetch() ?: [];
+}
+
+function notification_process_one(array $notification, bool $force = false, ?int $actorId = null): string
+{
+    $runtime = notification_delivery_runtime();
+    $notifyId = (int) $notification['notify_id'];
+    $attemptCount = notification_delivery_attempt_count($notifyId);
+    $latestDelivery = notification_latest_delivery($notifyId);
+    $status = (string) $notification['status'];
+
+    if (!$force && $attemptCount >= $runtime['max_attempts'] && $status !== 'pending') {
+        return 'Notification #' . $notifyId . ' skipped: retry limit reached.';
+    }
+
+    if (!$force && $status === 'failed' && $latestDelivery && $latestDelivery['status'] === 'skipped') {
+        return 'Notification #' . $notifyId . ' skipped: waiting for manual requeue.';
+    }
+
+    if (
+        !$force
+        && $status === 'failed'
+        && $latestDelivery
+        && $latestDelivery['status'] === 'failed'
+        && !empty($latestDelivery['next_retry_at'])
+        && strtotime((string) $latestDelivery['next_retry_at']) > time()
+    ) {
+        return 'Notification #' . $notifyId . ' skipped: retry window not reached.';
+    }
+
+    $preferences = notification_preferences_for_user((int) $notification['user_id']);
+    if (!$force && !notification_channel_is_enabled($preferences, (string) $notification['channel'])) {
+        $delivery = notification_record_delivery($notification, $attemptCount + 1, null, [
+            'status' => 'skipped',
+            'provider' => 'preference',
+            'provider_message_id' => null,
+            'provider_response' => null,
+            'error_message' => '使用者未啟用此通知管道。',
+        ]);
+
+        audit_log($actorId, 'system_notification_delivery', 'notification_deliveries', (string) ($delivery['delivery_id'] ?? ''), null, $delivery ?: null);
+        return 'Notification #' . $notifyId . ' skipped: channel disabled.';
+    }
+
+    [$recipient, $recipientError] = notification_recipient_for_channel($notification);
+    if ($recipient === null) {
+        $delivery = notification_record_delivery($notification, $attemptCount + 1, null, [
+            'status' => 'skipped',
+            'provider' => 'recipient',
+            'provider_message_id' => null,
+            'provider_response' => null,
+            'error_message' => $recipientError,
+        ]);
+
+        audit_log($actorId, 'system_notification_delivery', 'notification_deliveries', (string) ($delivery['delivery_id'] ?? ''), null, $delivery ?: null);
+        return 'Notification #' . $notifyId . ' skipped: recipient unavailable.';
+    }
+
+    $result = notification_send_via_channel($notification, $recipient);
+    $delivery = notification_record_delivery($notification, $attemptCount + 1, $recipient, $result);
+    audit_log($actorId, 'system_notification_delivery', 'notification_deliveries', (string) ($delivery['delivery_id'] ?? ''), null, $delivery ?: null);
+
+    return 'Notification #' . $notifyId . ' delivery status: ' . (string) ($delivery['status'] ?? 'unknown') . '.';
+}
+
+function notification_process_by_id(int $notifyId, bool $force = false, ?int $actorId = null): string
+{
+    $stmt = db()->prepare('SELECT * FROM notifications WHERE notify_id = ? LIMIT 1');
+    $stmt->execute([$notifyId]);
+    $notification = $stmt->fetch();
+
+    if (!$notification) {
+        return 'Notification #' . $notifyId . ' not found.';
+    }
+
+    return notification_process_one($notification, $force, $actorId);
 }
 
 function notification_process_pending(int $limit = 50): array

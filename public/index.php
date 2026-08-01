@@ -66,7 +66,7 @@ unset($lantern);
                         <?php foreach ($articles as $article): ?>
                             <article class="list-item">
                                 <h3><a href="article.php?id=<?= (int) $article['article_id'] ?>"><?= e($article['title']) ?></a></h3>
-                                <p><?= e(mb_substr(strip_tags($article['content']), 0, 80)) ?></p>
+                                <p><?= e(text_excerpt(strip_tags($article['content']), 80)) ?></p>
                             </article>
                         <?php endforeach; ?>
                     </div>
@@ -85,7 +85,7 @@ unset($lantern);
                 <?php foreach ($lanterns as $lantern): ?>
                     <article class="feature-card">
                         <h3><?= e($lantern['name']) ?></h3>
-                        <p><?= e(mb_substr((string) $lantern['description'], 0, 72)) ?></p>
+                        <p><?= e(text_excerpt((string) $lantern['description'], 0, 72)) ?></p>
                         <div class="meta-row">
                             <span>NT$ <?= e(number_format((float) $lantern['price'])) ?></span>
                             <span>剩餘 <?= (int) $lantern['available_count'] ?> 位</span>

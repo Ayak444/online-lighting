@@ -14,6 +14,7 @@ function admin_nav(): string
         ['dashboard.php', '總覽'],
         ['lantern_types.php', '燈種'],
         ['lamp_positions.php', '燈位'],
+        ['lamp_wall_editor.php', '燈牆編輯'],
         ['orders.php', '訂單'],
         ['service_periods.php', '年度燈期'],
         ['annual_flow_rules.php', '流年規則'],
@@ -105,7 +106,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $errors[] = '燈位代碼請使用 2-50 個英文、數字或連字號。';
         }
 
-        if (!in_array($status, ['available', 'occupied', 'maintenance'], true)) {
+        if (!in_array($status, ['available', 'occupied', 'maintenance', 'retired'], true)) {
             $errors[] = '燈位狀態不正確。';
         }
 
@@ -121,7 +122,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $errors[] = '佔用到期日格式不正確。';
         }
 
-        if ($status === 'available') {
+        if ($status === 'available' || $status === 'retired') {
             $occupiedUntil = null;
         }
 
@@ -129,17 +130,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt->execute([$typeId]);
         if (!$stmt->fetch()) {
             $errors[] = '選擇的燈種不存在。';
-        }
-
-        if ($positionId > 0 && $status !== 'occupied') {
-            $stmt = db()->prepare(
-                'SELECT COUNT(*) FROM order_items
-                 WHERE position_id = ? AND item_status IN ("assigned", "completed")'
-            );
-            $stmt->execute([$positionId]);
-            if ((int) $stmt->fetchColumn() > 0) {
-                $errors[] = '此燈位已有點燈紀錄，不能改成空位或維修。';
-            }
         }
 
         $payload = [
@@ -208,8 +198,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } catch (PDOException $exception) {
                 if ($exception->getCode() === '23000') {
                     $errors[] = '燈位代碼已存在，請換一個代碼。';
+                } elseif ($exception->getCode() === '45000' || strpos($exception->getMessage(), '資料庫完整性保護') !== false) {
+                    $errors[] = preg_replace('/SQLSTATE\[45000\]:.*?:\s*\d+\s*/', '', $exception->getMessage());
                 } else {
-                    $errors[] = '儲存燈位失敗，請稍後再試。';
+                    $errors[] = '儲存燈位失敗，請稍後再試。錯誤訊息：' . $exception->getMessage();
                 }
             }
         }
@@ -225,10 +217,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$before) {
             $errors[] = '找不到要刪除的燈位。';
         } else {
-            $stmt = db()->prepare('SELECT COUNT(*) FROM order_items WHERE position_id = ?');
-            $stmt->execute([$positionId]);
-            if ((int) $stmt->fetchColumn() > 0) {
-                $errors[] = '此燈位已有訂單明細紀錄，為了保留點燈軌跡不能刪除。';
+            $stmt = db()->prepare(
+                'SELECT
+                    (SELECT COUNT(*) FROM order_items WHERE position_id = ?) AS order_item_count,
+                    (SELECT COUNT(*) FROM lamp_reservations WHERE position_id = ?) AS reservation_count'
+            );
+            $stmt->execute([$positionId, $positionId]);
+            $dependencyCounts = $stmt->fetch();
+            $hasDependencies = ((int) ($dependencyCounts['order_item_count'] ?? 0) + (int) ($dependencyCounts['reservation_count'] ?? 0)) > 0;
+
+            if ($hasDependencies) {
+                $pdo = db();
+                $pdo->beginTransaction();
+
+                try {
+                    $stmt = $pdo->prepare(
+                        'UPDATE lamp_reservations
+                         SET status = CASE WHEN status = "active" THEN "cancelled" ELSE status END
+                         WHERE position_id = ?'
+                    );
+                    $stmt->execute([$positionId]);
+
+                    $archiveNote = trim((string) ($before['note'] ?? ''));
+                    $archiveNote = $archiveNote === '' ? '後台刪除後封存' : $archiveNote . '；後台刪除後封存';
+
+                    $stmt = $pdo->prepare(
+                        'UPDATE lamp_positions
+                         SET status = "retired",
+                             occupied_until = NULL,
+                             note = ?
+                         WHERE position_id = ?'
+                    );
+                    $stmt->execute([$archiveNote, $positionId]);
+
+                    $stmt = $pdo->prepare('SELECT * FROM lamp_positions WHERE position_id = ? LIMIT 1');
+                    $stmt->execute([$positionId]);
+                    $after = $stmt->fetch();
+
+                    audit_log($adminId, 'admin_lamp_position_archive', 'lamp_positions', (string) $positionId, $before, $after ?: null);
+                    $pdo->commit();
+
+                    set_flash('此燈位已有歷史紀錄，已改為封存並從前台燈牆移除。');
+                    redirect('lamp_positions.php');
+                } catch (Throwable $throwable) {
+                    $pdo->rollBack();
+                    $errors[] = '封存燈位失敗：' . $throwable->getMessage();
+                }
             } else {
                 $stmt = db()->prepare('DELETE FROM lamp_positions WHERE position_id = ?');
                 $stmt->execute([$positionId]);
@@ -336,7 +370,7 @@ $positions = $stmt->fetchAll();
                 <label>
                     狀態
                     <select name="status" required>
-                        <?php foreach (['available', 'occupied', 'maintenance'] as $status): ?>
+                        <?php foreach (['available', 'occupied', 'maintenance', 'retired'] as $status): ?>
                             <option value="<?= e($status) ?>" <?= $form['status'] === $status ? 'selected' : '' ?>>
                                 <?= e(lamp_position_status_label($status)) ?>
                             </option>

@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
+require_once __DIR__ . '/../config/notification_delivery.php';
 
 $admin = require_admin('login.php');
 $adminId = (int) $admin['user_id'];
@@ -15,18 +16,20 @@ function admin_nav(): string
 {
     $links = [
         ['dashboard.php', '儀表板'],
+        ['database.php', '資料庫'],
         ['lantern_types.php', '燈種'],
         ['lamp_positions.php', '燈位'],
+        ['lamp_wall_editor.php', '燈牆編輯'],
         ['orders.php', '訂單'],
-        ['service_periods.php', '年度燈期'],
+        ['service_periods.php', '服務年度'],
         ['annual_flow_rules.php', '流年規則'],
-        ['reports.php', '統計報表'],
-        ['scheduled_jobs.php', '排程任務'],
+        ['reports.php', '報表'],
+        ['scheduled_jobs.php', '排程'],
         ['notifications.php', '通知中心'],
-        ['users.php', '會員權限'],
-        ['articles.php', '內容管理'],
-        ['feedbacks.php', '問題回饋'],
-        ['logs.php', '操作軌跡'],
+        ['users.php', '使用者'],
+        ['articles.php', '公告'],
+        ['feedbacks.php', '回饋'],
+        ['logs.php', '操作紀錄'],
         ['logout.php', '登出'],
     ];
 
@@ -45,9 +48,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     $notifyId = (int) ($_POST['notify_id'] ?? 0);
+    $action = trim((string) ($_POST['action'] ?? 'update_status'));
     $nextStatus = trim((string) ($_POST['next_status'] ?? ''));
 
-    if (!in_array($nextStatus, ['pending', 'sent', 'failed', 'read'], true)) {
+    if ($notifyId <= 0) {
+        $errors[] = '通知編號不正確。';
+    }
+
+    if (!in_array($action, ['update_status', 'send_now'], true)) {
+        $errors[] = '不支援的操作。';
+    }
+
+    if ($action === 'update_status' && !in_array($nextStatus, ['pending', 'sent', 'failed', 'read'], true)) {
         $errors[] = '通知狀態不正確。';
     }
 
@@ -57,7 +69,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $before = $stmt->fetch();
 
         if (!$before) {
-            $errors[] = '找不到通知紀錄。';
+            $errors[] = '找不到通知資料。';
+        } elseif ($action === 'send_now') {
+            $message = notification_process_by_id($notifyId, true, $adminId);
+            set_flash('已執行立即寄送：' . $message);
+            redirect('notifications.php');
         } else {
             $sentAt = $nextStatus === 'sent' ? date('Y-m-d H:i:s') : $before['sent_at'];
             $stmt = db()->prepare(
@@ -171,9 +187,9 @@ $notifications = $stmt->fetchAll();
 
         <section class="panel">
             <form class="filter-form log-filter-form" method="get" action="notifications.php">
-                <input type="search" name="q" value="<?= e($query) ?>" placeholder="搜尋主旨、內容、會員或訂單">
+                <input type="search" name="q" value="<?= e($query) ?>" placeholder="搜尋主旨、內容、Email、訂單編號">
                 <select name="channel">
-                    <option value="">全部渠道</option>
+                    <option value="">全部管道</option>
                     <?php foreach (['email', 'sms', 'line', 'system'] as $channel): ?>
                         <option value="<?= e($channel) ?>" <?= $channelFilter === $channel ? 'selected' : '' ?>>
                             <?= e(notification_channel_label($channel)) ?>
@@ -198,12 +214,12 @@ $notifications = $stmt->fetchAll();
                     <thead>
                         <tr>
                             <th>建立時間</th>
-                            <th>會員</th>
-                            <th>渠道</th>
-                            <th>主旨</th>
+                            <th>使用者</th>
+                            <th>管道</th>
+                            <th>內容</th>
                             <th>來源</th>
                             <th>狀態</th>
-                            <th>投遞</th>
+                            <th>配送</th>
                             <th>操作</th>
                         </tr>
                     </thead>
@@ -221,7 +237,7 @@ $notifications = $stmt->fetchAll();
                                     <p class="helper-text"><?= e($notification['content']) ?></p>
                                 </td>
                                 <td>
-                                    <?= e((string) ($notification['job_name'] ?? '即時通知')) ?>
+                                    <?= e((string) ($notification['job_name'] ?? '一般通知')) ?>
                                     <?php if ($notification['order_number']): ?>
                                         <p class="helper-text">訂單 <?= e($notification['order_number']) ?></p>
                                     <?php endif; ?>
@@ -240,6 +256,7 @@ $notifications = $stmt->fetchAll();
                                 <td>
                                     <form class="inline-form" method="post" action="notifications.php">
                                         <?= csrf_field() ?>
+                                        <input type="hidden" name="action" value="update_status">
                                         <input type="hidden" name="notify_id" value="<?= e((string) $notification['notify_id']) ?>">
                                         <select name="next_status">
                                             <?php foreach (['pending', 'sent', 'failed', 'read'] as $status): ?>
@@ -249,6 +266,12 @@ $notifications = $stmt->fetchAll();
                                             <?php endforeach; ?>
                                         </select>
                                         <button class="button secondary" type="submit">更新</button>
+                                    </form>
+                                    <form class="inline-form" method="post" action="notifications.php">
+                                        <?= csrf_field() ?>
+                                        <input type="hidden" name="action" value="send_now">
+                                        <input type="hidden" name="notify_id" value="<?= e((string) $notification['notify_id']) ?>">
+                                        <button class="button" type="submit">立即寄送</button>
                                     </form>
                                 </td>
                             </tr>

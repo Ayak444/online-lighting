@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
+require_once __DIR__ . '/../config/renewal_notifications.php';
 
 $admin = require_admin('login.php');
 $adminId = (int) $admin['user_id'];
@@ -180,6 +181,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    if ($errors === [] && $action === 'send_renewal_now') {
+        $period = active_lamp_service_period();
+        if ($period === null) {
+            $errors[] = '目前沒有啟用中的年度燈期，無法發送續點通知。';
+        } else {
+            $result = send_renewal_notifications_now($period, $adminId);
+            set_flash(
+                '續點通知已發送。對象 ' . (int) $result['recipient_count']
+                . ' 位，成功 ' . (int) $result['sent_count']
+                . ' 位，失敗 ' . (int) $result['failed_count'] . ' 位。'
+            );
+            redirect('scheduled_jobs.php');
+        }
+    }
+
     if ($errors === [] && $action === 'update_status') {
         $nextStatus = trim((string) ($_POST['next_status'] ?? 'paused'));
         if (!in_array($nextStatus, ['active', 'paused', 'finished'], true)) {
@@ -201,6 +217,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 set_flash('排程狀態已更新。');
                 redirect('scheduled_jobs.php');
             }
+        }
+    }
+
+    if ($errors === [] && $action === 'delete_job') {
+        $before = load_job($jobId);
+        if ($before === null) {
+            $errors[] = '找不到要刪除的排程。';
+        } else {
+            $stmt = db()->prepare('DELETE FROM scheduled_jobs WHERE job_id = ?');
+            $stmt->execute([$jobId]);
+            audit_log($adminId, 'admin_scheduled_job_delete', 'scheduled_jobs', (string) $jobId, $before, null);
+            set_flash('排程已刪除。');
+            redirect('scheduled_jobs.php');
         }
     }
 }
@@ -254,6 +283,20 @@ $formJob = $editJob ?: [
                 <?php endforeach; ?>
             </div>
         <?php endif; ?>
+
+        <section class="panel">
+            <div class="section-heading">
+                <div>
+                    <h2>續點通知</h2>
+                    <p class="helper-text">立即寄送 Email 給目前年度已付款且已審核通過的點燈會員，提醒年度燈期到期並前往智慧續點。</p>
+                </div>
+                <form method="post" action="scheduled_jobs.php" onsubmit="return confirm('確定要立即發送續點通知 Email？');">
+                    <?= csrf_field() ?>
+                    <input type="hidden" name="action" value="send_renewal_now">
+                    <button class="button" type="submit">一鍵發送續點通知</button>
+                </form>
+            </div>
+        </section>
 
         <section class="panel">
             <div class="section-heading">
@@ -380,6 +423,12 @@ $formJob = $editJob ?: [
                                             <input type="hidden" name="job_id" value="<?= e((string) $job['job_id']) ?>">
                                             <input type="hidden" name="next_status" value="<?= $job['status'] === 'active' ? 'paused' : 'active' ?>">
                                             <button class="link-button" type="submit"><?= $job['status'] === 'active' ? '暫停' : '啟用' ?></button>
+                                        </form>
+                                        <form method="post" action="scheduled_jobs.php" onsubmit="return confirm('確定要刪除此排程？');">
+                                            <?= csrf_field() ?>
+                                            <input type="hidden" name="action" value="delete_job">
+                                            <input type="hidden" name="job_id" value="<?= e((string) $job['job_id']) ?>">
+                                            <button class="link-button danger" type="submit">刪除</button>
                                         </form>
                                     </div>
                                 </td>

@@ -21,6 +21,7 @@ function admin_nav(): string
         ['scheduled_jobs.php', '排程任務'],
         ['notifications.php', '通知中心'],
         ['users.php', '會員權限'],
+        ['admin_accounts.php', '管理員帳號'],
         ['articles.php', '公告文化'],
         ['feedbacks.php', '回饋'],
         ['logs.php', '操作軌跡'],
@@ -124,7 +125,7 @@ function sync_user_roles(PDO $pdo, int $userId, array $roleNames, array $rolesBy
     }
 }
 
-$stmt = db()->query('SELECT role_id, role_name, display_name FROM roles ORDER BY role_id');
+$stmt = db()->query("SELECT role_id, role_name, display_name FROM roles WHERE role_name != 'staff' ORDER BY role_id");
 $roles = $stmt->fetchAll();
 $rolesByName = [];
 foreach ($roles as $role) {
@@ -324,6 +325,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     }
+
+    if ($errors === [] && $action === 'delete_user') {
+        $userId = (int) ($_POST['user_id'] ?? 0);
+
+        if ($userId <= 0) {
+            $errors[] = '使用者編號不正確。';
+        } elseif ($userId === $adminId) {
+            $errors[] = '不能刪除目前登入中的管理員帳號。';
+        } else {
+            $pdo = db();
+            $pdo->beginTransaction();
+
+            try {
+                $stmt = $pdo->prepare('SELECT * FROM users WHERE user_id = ? LIMIT 1 FOR UPDATE');
+                $stmt->execute([$userId]);
+                $before = $stmt->fetch();
+
+                if (!$before) {
+                    throw new RuntimeException('找不到要刪除的使用者。');
+                }
+
+                $stmt = $pdo->prepare('SELECT COUNT(*) FROM orders WHERE user_id = ?');
+                $stmt->execute([$userId]);
+                if ((int) $stmt->fetchColumn() > 0) {
+                    throw new RuntimeException('此使用者已有訂單紀錄，不能硬刪。請改用停用帳號。');
+                }
+
+                $beforeRoles = get_user_roles($userId);
+                $stmt = $pdo->prepare('DELETE FROM users WHERE user_id = ?');
+                $stmt->execute([$userId]);
+
+                audit_log($adminId, 'admin_user_delete', 'users', (string) $userId, array_merge($before, [
+                    'roles' => $beforeRoles,
+                ]), null);
+
+                $pdo->commit();
+                set_flash('使用者已刪除。');
+                redirect('users.php');
+            } catch (Throwable $throwable) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $errors[] = $throwable->getMessage();
+            }
+        }
+    }
 }
 
 $editUser = null;
@@ -512,6 +559,7 @@ $rolesByUser = load_user_roles_assoc(array_map(static function (array $user): in
 
                 <div class="full-span">
                     <h3>角色權限</h3>
+                    <p class="helper-text">一般會員請勾選「會員（member）」；需要登入後台的管理人員，請同時勾選「系統管理員（admin）」。</p>
                     <div class="role-checkbox-grid">
                         <?php foreach ($roles as $role): ?>
                             <label class="checkbox-row">
@@ -626,7 +674,19 @@ $rolesByUser = load_user_roles_assoc(array_map(static function (array $user): in
                                 <td><?= (int) $listUser['dependent_count'] ?></td>
                                 <td><?= (int) $listUser['order_count'] ?></td>
                                 <td><?= (int) $listUser['feedback_count'] ?></td>
-                                <td><a href="users.php?edit_id=<?= (int) $listUser['user_id'] ?>">編輯</a></td>
+                                <td>
+                                    <div class="table-actions">
+                                        <a href="users.php?edit_id=<?= (int) $listUser['user_id'] ?>">編輯</a>
+                                        <?php if ((int) $listUser['user_id'] !== $adminId): ?>
+                                            <form method="post" action="users.php" onsubmit="return confirm('確定要刪除此使用者？已有訂單者系統會拒絕刪除。');">
+                                                <?= csrf_field() ?>
+                                                <input type="hidden" name="action" value="delete_user">
+                                                <input type="hidden" name="user_id" value="<?= (int) $listUser['user_id'] ?>">
+                                                <button class="link-button danger" type="submit">刪除</button>
+                                            </form>
+                                        <?php endif; ?>
+                                    </div>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>

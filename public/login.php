@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
-require_once __DIR__ . '/../config/external_auth.php';
+
 
 start_app_session();
 
@@ -83,23 +83,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <button class="button" type="submit">登入</button>
         </form>
 
+        <p class="helper-text"><a href="forgot_password.php">忘記密碼？</a></p>
+
         <section class="panel section-gap">
             <h2>其他登入方式</h2>
             <div class="stack-list">
-                <?php foreach (['google', 'line'] as $provider): ?>
-                    <article class="list-item">
-                        <h3><?= e(auth_provider_label($provider)) ?> 登入</h3>
-                        <?php if (auth_provider_is_configured($provider)): ?>
-                            <?php if ($provider === 'google'): ?>
-                                <p class="helper-text">第一次使用 Google 會自動建立會員帳號。</p>
-                            <?php endif; ?>
-                            <a class="button" href="oauth_start.php?provider=<?= e($provider) ?>">使用 <?= e(auth_provider_label($provider)) ?> 繼續</a>
-                        <?php else: ?>
-                            <p class="helper-text"><?= e(auth_provider_label($provider)) ?> 登入尚未完成金鑰設定。</p>
-                        <?php endif; ?>
-                    </article>
-                <?php endforeach; ?>
-
                 <article class="list-item">
                     <h3>手機驗證碼登入</h3>
                     <p class="helper-text">以會員資料中綁定的手機號碼收取一次性驗證碼登入。</p>

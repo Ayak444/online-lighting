@@ -26,6 +26,11 @@ return [
             'driver' => 'mock',
             'from_address' => 'no-reply@example.test',
             'from_name' => '線上點燈系統',
+            'smtp_host' => '',
+            'smtp_port' => 587,
+            'smtp_username' => '',
+            'smtp_password' => '',
+            'smtp_encryption' => 'tls',
         ],
         'sms' => [
             'driver' => 'mock',

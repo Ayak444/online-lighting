@@ -185,6 +185,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('articles.php');
         }
     }
+
+    if ($errors === [] && $action === 'delete_article') {
+        $articleId = (int) ($_POST['article_id'] ?? 0);
+        $stmt = db()->prepare('SELECT * FROM articles WHERE article_id = ? LIMIT 1');
+        $stmt->execute([$articleId]);
+        $before = $stmt->fetch();
+
+        if (!$before) {
+            $errors[] = '找不到要刪除的公告/文章。';
+        } else {
+            $stmt = db()->prepare('DELETE FROM articles WHERE article_id = ?');
+            $stmt->execute([$articleId]);
+
+            audit_log($adminId, 'admin_article_delete', 'articles', (string) $articleId, $before, null);
+            set_flash('公告/文章已刪除。');
+            redirect('articles.php');
+        }
+    }
 }
 
 $editArticle = null;
@@ -337,7 +355,7 @@ $articles = $stmt->fetchAll();
                                 <td><?= e(article_type_label($article['article_type'])) ?></td>
                                 <td>
                                     <strong><?= e($article['title']) ?></strong>
-                                    <p class="helper-text"><?= e(mb_substr(strip_tags($article['content']), 0, 60)) ?></p>
+                                    <p class="helper-text"><?= e(text_excerpt(strip_tags($article['content']), 0, 60)) ?></p>
                                 </td>
                                 <td><?= e(article_status_label($article['status'])) ?></td>
                                 <td><?= e($article['author_name'] ?? '-') ?></td>
@@ -350,6 +368,12 @@ $articles = $stmt->fetchAll();
                                             <input type="hidden" name="action" value="archive_article">
                                             <input type="hidden" name="article_id" value="<?= (int) $article['article_id'] ?>">
                                             <button class="link-button" type="submit">封存</button>
+                                        </form>
+                                        <form method="post" action="articles.php" onsubmit="return confirm('確定要刪除此公告/文章？');">
+                                            <?= csrf_field() ?>
+                                            <input type="hidden" name="action" value="delete_article">
+                                            <input type="hidden" name="article_id" value="<?= (int) $article['article_id'] ?>">
+                                            <button class="link-button danger" type="submit">刪除</button>
                                         </form>
                                     </div>
                                 </td>

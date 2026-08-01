@@ -170,6 +170,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('annual_flow_rules.php');
         }
     }
+
+    if ($errors === [] && $action === 'delete_rule') {
+        $before = load_rule($ruleId);
+        if ($before === null) {
+            $errors[] = '找不到要刪除的流年規則。';
+        } else {
+            $stmt = db()->prepare('DELETE FROM annual_flow_rules WHERE rule_id = ?');
+            $stmt->execute([$ruleId]);
+            audit_log($adminId, 'admin_annual_flow_rule_delete', 'annual_flow_rules', (string) $ruleId, $before, null);
+            set_flash('流年規則已刪除。');
+            redirect('annual_flow_rules.php');
+        }
+    }
 }
 
 $lanternTypes = db()->query(
@@ -347,6 +360,12 @@ $formRule = $editRule ?: [
                                             <input type="hidden" name="action" value="toggle_rule">
                                             <input type="hidden" name="rule_id" value="<?= e((string) $rule['rule_id']) ?>">
                                             <button class="link-button" type="submit"><?= (int) $rule['is_active'] === 1 ? '停用' : '啟用' ?></button>
+                                        </form>
+                                        <form method="post" action="annual_flow_rules.php" onsubmit="return confirm('確定要刪除此流年規則？');">
+                                            <?= csrf_field() ?>
+                                            <input type="hidden" name="action" value="delete_rule">
+                                            <input type="hidden" name="rule_id" value="<?= e((string) $rule['rule_id']) ?>">
+                                            <button class="link-button danger" type="submit">刪除</button>
                                         </form>
                                     </div>
                                 </td>

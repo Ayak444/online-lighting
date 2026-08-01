@@ -83,27 +83,50 @@ function member_assign_available_lamp_positions(PDO $pdo, array $order): array
             continue;
         }
 
-        $stmt = $pdo->prepare(
-            'SELECT lp.*, lr.reservation_id
-             FROM lamp_reservations lr
-             INNER JOIN lamp_positions lp ON lp.position_id = lr.position_id
-             WHERE lr.order_item_id = ?
-               AND lr.status = "active"
-               AND lr.expires_at > NOW()
-               AND lp.status = "available"
-             ORDER BY lr.reservation_id DESC
-             LIMIT 1
-             FOR UPDATE'
-        );
-        $stmt->execute([(int) $item['detail_id']]);
-        $position = $stmt->fetch();
+        $position = null;
+        if (!empty($item['position_id'])) {
+            $stmt = $pdo->prepare(
+                'SELECT lp.*, NULL AS reservation_id
+                 FROM lamp_positions lp
+                 WHERE lp.position_id = ?
+                   AND lp.type_id = ?
+                   AND lp.status <> "retired"
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $stmt->execute([(int) $item['position_id'], (int) $item['type_id']]);
+            $position = $stmt->fetch();
+        }
 
         if (!$position) {
+            $stmt = $pdo->prepare(
+                'SELECT lp.*, lr.reservation_id
+                 FROM lamp_reservations lr
+                 INNER JOIN lamp_positions lp ON lp.position_id = lr.position_id
+                 WHERE lr.order_item_id = ?
+                   AND lr.status = "active"
+                   AND lr.expires_at > NOW()
+                   AND lp.status <> "retired"
+                 ORDER BY lr.reservation_id DESC
+                 LIMIT 1
+                 FOR UPDATE'
+            );
+            $stmt->execute([(int) $item['detail_id']]);
+            $position = $stmt->fetch();
+        }
+
+        if (!$position) {
+            $periodStartDate = (string) ($item['blessing_start_date'] ?? '');
             $stmt = $pdo->prepare(
                 'SELECT lp.*, NULL AS reservation_id
                  FROM lamp_positions lp
                  WHERE lp.type_id = ?
-                   AND lp.status = "available"
+                   AND lp.status <> "retired"
+                   AND (
+                       lp.status = "available"
+                       OR lp.occupied_until IS NULL
+                       OR lp.occupied_until < ?
+                   )
                    AND NOT EXISTS (
                        SELECT 1
                        FROM lamp_reservations lr
@@ -115,12 +138,12 @@ function member_assign_available_lamp_positions(PDO $pdo, array $order): array
                  LIMIT 1
                  FOR UPDATE'
             );
-            $stmt->execute([(int) $item['type_id']]);
+            $stmt->execute([(int) $item['type_id'], $periodStartDate !== '' ? $periodStartDate : date('Y-m-d')]);
             $position = $stmt->fetch();
         }
 
         if (!$position) {
-            throw new RuntimeException($item['lantern_name_snapshot'] . ' 目前沒有可用燈位，請先到後台新增燈位。');
+            throw new RuntimeException(lamp_stock_unavailable_message((int) $item['type_id'], (string) $item['lantern_name_snapshot']));
         }
 
         $blessingStartDate = $item['blessing_start_date'] ?: lamp_blessing_start_date((string) ($order['paid_at'] ?? ''));
@@ -204,7 +227,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = trim((string) ($_POST['action'] ?? ''));
     $orderId = (int) ($_POST['order_id'] ?? 0);
 
-    if ($errors === [] && $action !== 'mock_pay_and_light') {
+    if ($errors === [] && !in_array($action, ['mock_pay_and_light', 'submit_bank_transfer', 'cancel_order'], true)) {
         $errors[] = '未知的訂單操作。';
     }
 
@@ -228,6 +251,116 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if ($order['payment_status'] === 'refunded') {
                 throw new RuntimeException('已退款訂單不能執行測試付款。');
+            }
+
+            if ($action === 'cancel_order') {
+                if ($order['payment_status'] !== 'unpaid' || $order['order_status'] !== 'pending_payment') {
+                    throw new RuntimeException('只有未付款的訂單才能取消。');
+                }
+
+                $stmt = $pdo->prepare('UPDATE orders SET order_status = "cancelled", review_status = "rejected", note = CONCAT(COALESCE(note, ""), "\n信眾自行取消訂單。") WHERE order_id = ?');
+                $stmt->execute([$orderId]);
+
+                $stmt = $pdo->prepare('UPDATE order_items SET item_status = "cancelled" WHERE order_id = ?');
+                $stmt->execute([$orderId]);
+
+                $stmt = $pdo->prepare(
+                    'UPDATE lamp_reservations lr
+                     INNER JOIN order_items oi ON oi.detail_id = lr.order_item_id
+                     SET lr.status = "cancelled"
+                     WHERE oi.order_id = ? AND lr.status = "active"'
+                );
+                $stmt->execute([$orderId]);
+
+                audit_log($userId, 'member_cancel_order', 'orders', (string) $orderId, $order, ['status' => 'cancelled']);
+                
+                $pdo->commit();
+                set_flash('訂單已取消，原保留之燈位已釋出。');
+                redirect('orders.php?order_id=' . $orderId);
+            }
+
+            if ($action === 'submit_bank_transfer') {
+                if ($order['payment_status'] !== 'unpaid') {
+                    throw new RuntimeException('此訂單已付款或已進入付款處理流程。');
+                }
+
+                $payerName = trim((string) ($_POST['payer_name'] ?? ''));
+                $transactionNo = trim((string) ($_POST['transaction_no'] ?? ''));
+                $paidAtInput = trim((string) ($_POST['paid_at'] ?? ''));
+
+                if ($payerName === '') {
+                    throw new RuntimeException('請填寫匯款人姓名。');
+                }
+
+                if ($transactionNo === '') {
+                    throw new RuntimeException('請填寫交易序號或帳號末五碼。');
+                }
+
+                $paidAt = null;
+                if ($paidAtInput !== '') {
+                    $timestamp = strtotime(str_replace('T', ' ', $paidAtInput));
+                    if ($timestamp === false) {
+                        throw new RuntimeException('匯款時間格式不正確。');
+                    }
+                    $paidAt = date('Y-m-d H:i:s', $timestamp);
+                }
+
+                $rawPayload = json_encode([
+                    'source' => 'member_bank_transfer_report',
+                    'payer_name' => $payerName,
+                    'transaction_no' => $transactionNo,
+                    'reported_at' => date('c'),
+                ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+                $stmt = $pdo->prepare(
+                    'SELECT *
+                     FROM payments
+                     WHERE order_id = ?
+                     ORDER BY payment_id DESC
+                     LIMIT 1
+                     FOR UPDATE'
+                );
+                $stmt->execute([$orderId]);
+                $payment = $stmt->fetch();
+
+                if ($payment) {
+                    $stmt = $pdo->prepare(
+                        'UPDATE payments
+                         SET payment_method = "bank_transfer",
+                             payment_status = "pending",
+                             transaction_no = ?,
+                             payer_name = ?,
+                             paid_at = ?,
+                             raw_payload = ?
+                         WHERE payment_id = ?'
+                    );
+                    $stmt->execute([$transactionNo, $payerName, $paidAt, $rawPayload, (int) $payment['payment_id']]);
+                } else {
+                    $stmt = $pdo->prepare(
+                        'INSERT INTO payments (order_id, payment_method, amount, payment_status, transaction_no, payer_name, paid_at, raw_payload)
+                         VALUES (?, "bank_transfer", ?, "pending", ?, ?, ?, ?)'
+                    );
+                    $stmt->execute([$orderId, (float) $order['total_amount'], $transactionNo, $payerName, $paidAt, $rawPayload]);
+                }
+
+                member_create_order_notification(
+                    $pdo,
+                    $userId,
+                    $orderId,
+                    null,
+                    '已收到匯款回報',
+                    '您的訂單 ' . $order['order_number'] . ' 已送出匯款資料，管理員對帳後會更新付款狀態。'
+                );
+
+                audit_log($userId, 'member_bank_transfer_report', 'orders', (string) $orderId, $order, [
+                    'payer_name' => $payerName,
+                    'transaction_no' => $transactionNo,
+                    'paid_at' => $paidAt,
+                ]);
+
+                $pdo->commit();
+                set_flash('已送出匯款資料，請等待管理員對帳確認。');
+                redirect('orders.php?order_id=' . $orderId);
             }
 
             $before = $order;
@@ -353,7 +486,7 @@ if ($orders !== []) {
     }
 
     $stmt = db()->prepare(
-        "SELECT order_id, payment_method, amount, payment_status, transaction_no, paid_at, created_at
+        "SELECT order_id, payment_method, amount, payment_status, transaction_no, payer_name, paid_at, created_at
          FROM payments
          WHERE order_id IN ($placeholders)
          ORDER BY payment_id"
@@ -517,6 +650,36 @@ $showSuccessStage = $focusedOrder !== null && in_array($focusedOrder['order_stat
                                     <input type="hidden" name="order_id" value="<?= $orderId ?>">
                                     <button class="button" type="submit">略過付款並完成測試點燈</button>
                                 </form>
+                                <form method="post" action="orders.php" style="margin-top: 1rem;" onsubmit="return confirm('確定要取消這筆訂單嗎？取消後，您所保留的燈位將被釋出。');">
+                                    <?= csrf_field() ?>
+                                    <input type="hidden" name="action" value="cancel_order">
+                                    <input type="hidden" name="order_id" value="<?= $orderId ?>">
+                                    <button class="button danger" type="submit">取消訂單</button>
+                                </form>
+                            </section>
+                            <section class="panel nested-panel">
+                                <h3>銀行匯款回報</h3>
+                                <p class="helper-text">完成轉帳後填寫資料，管理員會在後台對帳並確認付款。測試展示時仍可使用上方跳過付款按鈕。</p>
+                                <form class="form grid-form" method="post" action="orders.php">
+                                    <?= csrf_field() ?>
+                                    <input type="hidden" name="action" value="submit_bank_transfer">
+                                    <input type="hidden" name="order_id" value="<?= $orderId ?>">
+                                    <label>
+                                        匯款人姓名
+                                        <input type="text" name="payer_name" required maxlength="100">
+                                    </label>
+                                    <label>
+                                        交易序號或帳號末五碼
+                                        <input type="text" name="transaction_no" required maxlength="100">
+                                    </label>
+                                    <label>
+                                        匯款時間
+                                        <input type="datetime-local" name="paid_at">
+                                    </label>
+                                    <div class="form-actions">
+                                        <button class="button secondary" type="submit">送出匯款資料</button>
+                                    </div>
+                                </form>
                             </section>
                         <?php elseif ($order['payment_status'] === 'paid' && in_array($order['order_status'], ['assigned', 'completed'], true)): ?>
                             <div class="alert success">
@@ -545,7 +708,12 @@ $showSuccessStage = $focusedOrder !== null && in_array($focusedOrder['order_stat
                                         <tr>
                                             <td><?= e(payment_method_label($payment['payment_method'])) ?></td>
                                             <td><?= e(payment_record_status_label($payment['payment_status'])) ?></td>
-                                            <td><?= e($payment['transaction_no']) ?></td>
+                                            <td>
+                                                <?= e($payment['transaction_no']) ?>
+                                                <?php if (!empty($payment['payer_name'])): ?>
+                                                    <p class="helper-text">匯款人：<?= e($payment['payer_name']) ?></p>
+                                                <?php endif; ?>
+                                            </td>
                                             <td>NT$ <?= e(number_format((float) $payment['amount'])) ?></td>
                                             <td><?= e($payment['created_at']) ?></td>
                                         </tr>

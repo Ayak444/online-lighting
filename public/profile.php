@@ -2,7 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
-require_once __DIR__ . '/../config/external_auth.php';
+
 require_once __DIR__ . '/../config/notification_delivery.php';
 require_once __DIR__ . '/../config/birth_profile.php';
 
@@ -376,10 +376,7 @@ $dependentForm = $editDependent ?: [
     'note' => '',
 ];
 
-$linkedIdentities = [];
-foreach (auth_identity_list_for_user($userId) as $identity) {
-    $linkedIdentities[$identity['provider']] = $identity;
-}
+
 $notificationPreferences = notification_preferences_for_user($userId);
 $activePeriod = active_lamp_service_period();
 $serviceYear = $activePeriod ? (int) $activePeriod['service_year'] : (int) date('Y');
@@ -501,40 +498,11 @@ foreach ($dependents as $dependent) {
             </form>
         </section>
 
-        <section class="panel section-gap">
-            <h2>第三方登入綁定</h2>
-            <div class="stack-list">
-                <?php foreach (['google', 'line'] as $provider): ?>
-                    <?php $identity = $linkedIdentities[$provider] ?? null; ?>
-                    <article class="list-item">
-                        <div class="section-heading">
-                            <div>
-                                <h3><?= e(auth_provider_label($provider)) ?></h3>
-                                <?php if ($identity): ?>
-                                    <p class="helper-text">
-                                        已綁定 <?= e((string) ($identity['display_name'] ?? '')) ?>
-                                        <?php if (!empty($identity['provider_email'])): ?>
-                                            / <?= e((string) $identity['provider_email']) ?>
-                                        <?php endif; ?>
-                                    </p>
-                                <?php else: ?>
-                                    <p class="helper-text">尚未綁定。</p>
-                                <?php endif; ?>
-                            </div>
-                            <?php if (!$identity && auth_provider_is_configured($provider)): ?>
-                                <a class="button secondary" href="oauth_start.php?provider=<?= e($provider) ?>&mode=link">立即綁定</a>
-                            <?php elseif (!$identity): ?>
-                                <span class="helper-text">尚未完成金鑰設定</span>
-                            <?php endif; ?>
-                        </div>
-                    </article>
-                <?php endforeach; ?>
-            </div>
-        </section>
+
 
         <section class="panel section-gap">
             <h2>通知偏好</h2>
-            <form class="form grid-form" method="post" action="profile.php">
+            <form class="form notification-preference-form" method="post" action="profile.php">
                 <?= csrf_field() ?>
                 <input type="hidden" name="action" value="update_notification_preferences">
 
@@ -548,10 +516,7 @@ foreach ($dependents as $dependent) {
                     簡訊通知
                 </label>
 
-                <label class="checkbox-row">
-                    <input type="checkbox" name="line_enabled" <?= (int) $notificationPreferences['line_enabled'] === 1 ? 'checked' : '' ?>>
-                    LINE 通知
-                </label>
+
 
                 <label class="checkbox-row">
                     <input type="checkbox" name="system_enabled" <?= (int) $notificationPreferences['system_enabled'] === 1 ? 'checked' : '' ?>>

@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../config/frontend.php';
+require_once __DIR__ . '/../config/notification_delivery.php';
 
 $admin = require_admin('login.php');
 $adminId = (int) $admin['user_id'];
@@ -92,7 +93,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $feedbackId,
             ]);
 
-            if (!empty($before['user_id']) && $replyValue !== null) {
+            $notificationIds = [];
+            if (!empty($before['user_id']) && $status === 'processing' && (string) $before['status'] !== 'processing') {
+                $stmt = $pdo->prepare(
+                    'INSERT INTO notifications (user_id, channel, subject, content, status)
+                     VALUES (?, "email", ?, ?, "pending")'
+                );
+                $stmt->execute([
+                    (int) $before['user_id'],
+                    '您的問題回饋已進入處理中',
+                    '您的回饋「' . $before['subject'] . '」已由後台管理員標記為處理中，我們會盡快回覆您。',
+                ]);
+                $notificationIds[] = (int) $pdo->lastInsertId();
+            }
+
+            if (!empty($before['user_id']) && $replyValue !== null && (string) ($before['admin_reply'] ?? '') !== $replyValue) {
                 $stmt = $pdo->prepare(
                     'INSERT INTO notifications (user_id, channel, subject, content, status)
                      VALUES (?, "email", ?, ?, "pending")'
@@ -100,8 +115,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt->execute([
                     (int) $before['user_id'],
                     '問題回饋已回覆',
-                    '您的回饋「' . $before['subject'] . '」已有後台回覆，請至問題回饋頁查看。',
+                    '您的回饋「' . $before['subject'] . "」已有後台回覆：\n\n" . $replyValue . "\n\n請至問題回饋頁查看完整紀錄。",
                 ]);
+                $notificationIds[] = (int) $pdo->lastInsertId();
             }
 
             audit_log($adminId, 'admin_feedback_reply', 'feedbacks', (string) $feedbackId, $before, [
@@ -112,6 +128,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
 
             $pdo->commit();
+
+            foreach ($notificationIds as $notifyId) {
+                notification_process_by_id($notifyId, true, $adminId);
+            }
+
             set_flash('回饋已更新。');
             redirect('feedbacks.php');
         } catch (Throwable $throwable) {

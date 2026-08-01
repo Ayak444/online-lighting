@@ -3,6 +3,28 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/auth.php';
 
+function text_excerpt(string $value, int $length): string
+{
+    if ($length <= 0) {
+        return '';
+    }
+
+    if (function_exists('mb_substr')) {
+        return mb_substr($value, 0, $length);
+    }
+
+    if (preg_match_all('/./us', $value, $matches)) {
+        return implode('', array_slice($matches[0], 0, $length));
+    }
+
+    return substr($value, 0, $length);
+}
+
+function text_first_char(string $value): string
+{
+    return text_excerpt($value, 1);
+}
+
 function ensure_cart_id(int $userId): int
 {
     $stmt = db()->prepare('SELECT cart_id FROM carts WHERE user_id = ? LIMIT 1');
@@ -69,6 +91,267 @@ function available_lamp_counts_by_type(array $typeIds): array
     }
 
     return $counts;
+}
+
+function lamp_service_period_by_id(int $periodId): ?array
+{
+    if ($periodId <= 0) {
+        return null;
+    }
+
+    $stmt = db()->prepare('SELECT * FROM lamp_service_periods WHERE period_id = ? LIMIT 1');
+    $stmt->execute([$periodId]);
+    $period = $stmt->fetch();
+
+    return $period ?: null;
+}
+
+function next_lamp_service_period(?array $currentPeriod = null): ?array
+{
+    $currentPeriod = $currentPeriod ?: active_lamp_service_period();
+    $params = [];
+    $where = 'status IN ("draft", "active")';
+
+    if ($currentPeriod !== null) {
+        $where .= ' AND service_year > ?';
+        $params[] = (int) $currentPeriod['service_year'];
+    } else {
+        $where .= ' AND service_year >= ?';
+        $params[] = (int) date('Y') + 1;
+    }
+
+    $stmt = db()->prepare(
+        'SELECT *
+         FROM lamp_service_periods
+         WHERE ' . $where . '
+         ORDER BY service_year ASC, period_id ASC
+         LIMIT 1'
+    );
+    $stmt->execute($params);
+    $period = $stmt->fetch();
+
+    return $period ?: null;
+}
+
+function lamp_stock_breakdown_by_type(array $typeIds): array
+{
+    if ($typeIds === []) {
+        return [];
+    }
+
+    $pdo = db();
+    expire_lamp_reservations($pdo);
+
+    $typeIds = array_values(array_unique(array_map('intval', $typeIds)));
+    $placeholders = implode(',', array_fill(0, count($typeIds), '?'));
+    $stmt = $pdo->prepare(
+        "SELECT lp.type_id,
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN lp.status = 'available'
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM lamp_reservations lr
+                        WHERE lr.position_id = lp.position_id
+                          AND lr.status = 'active'
+                          AND lr.expires_at > NOW()
+                    ) THEN 1 ELSE 0 END) AS available_count,
+                SUM(CASE WHEN lp.status = 'available'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM lamp_reservations lr
+                        WHERE lr.position_id = lp.position_id
+                          AND lr.status = 'active'
+                          AND lr.expires_at > NOW()
+                    ) THEN 1 ELSE 0 END) AS reserved_count,
+                SUM(CASE WHEN lp.status = 'occupied' THEN 1 ELSE 0 END) AS occupied_count,
+                SUM(CASE WHEN lp.status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_count,
+                SUM(CASE WHEN lp.status = 'retired' THEN 1 ELSE 0 END) AS retired_count
+         FROM lamp_positions lp
+         WHERE lp.type_id IN ($placeholders)
+         GROUP BY lp.type_id"
+    );
+    $stmt->execute($typeIds);
+
+    $empty = [
+        'total_count' => 0,
+        'available_count' => 0,
+        'reserved_count' => 0,
+        'occupied_count' => 0,
+        'maintenance_count' => 0,
+        'retired_count' => 0,
+    ];
+    $breakdown = array_fill_keys($typeIds, $empty);
+
+    foreach ($stmt->fetchAll() as $row) {
+        $typeId = (int) $row['type_id'];
+        $breakdown[$typeId] = [
+            'total_count' => (int) $row['total_count'],
+            'available_count' => (int) $row['available_count'],
+            'reserved_count' => (int) $row['reserved_count'],
+            'occupied_count' => (int) $row['occupied_count'],
+            'maintenance_count' => (int) $row['maintenance_count'],
+            'retired_count' => (int) $row['retired_count'],
+        ];
+    }
+
+    return $breakdown;
+}
+
+function lamp_stock_breakdown_by_type_for_period(array $typeIds, ?array $period): array
+{
+    if ($typeIds === []) {
+        return [];
+    }
+
+    if ($period === null || empty($period['blessing_start_date'])) {
+        return lamp_stock_breakdown_by_type($typeIds);
+    }
+
+    $pdo = db();
+    expire_lamp_reservations($pdo);
+
+    $typeIds = array_values(array_unique(array_map('intval', $typeIds)));
+    $placeholders = implode(',', array_fill(0, count($typeIds), '?'));
+    $params = array_merge([(string) $period['blessing_start_date'], (string) $period['blessing_start_date']], $typeIds);
+    $stmt = $pdo->prepare(
+        "SELECT lp.type_id,
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN lp.status <> 'retired'
+                    AND (
+                        lp.status = 'available'
+                        OR lp.occupied_until IS NULL
+                        OR lp.occupied_until < ?
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM lamp_reservations lr
+                        WHERE lr.position_id = lp.position_id
+                          AND lr.status = 'active'
+                          AND lr.expires_at > NOW()
+                    ) THEN 1 ELSE 0 END) AS available_count,
+                SUM(CASE WHEN lp.status <> 'retired'
+                    AND (
+                        lp.status = 'available'
+                        OR lp.occupied_until IS NULL
+                        OR lp.occupied_until < ?
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM lamp_reservations lr
+                        WHERE lr.position_id = lp.position_id
+                          AND lr.status = 'active'
+                          AND lr.expires_at > NOW()
+                    ) THEN 1 ELSE 0 END) AS reserved_count,
+                SUM(CASE WHEN lp.status = 'occupied' THEN 1 ELSE 0 END) AS occupied_count,
+                SUM(CASE WHEN lp.status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_count,
+                SUM(CASE WHEN lp.status = 'retired' THEN 1 ELSE 0 END) AS retired_count
+         FROM lamp_positions lp
+         WHERE lp.type_id IN ($placeholders)
+         GROUP BY lp.type_id"
+    );
+    $stmt->execute($params);
+
+    $empty = [
+        'total_count' => 0,
+        'available_count' => 0,
+        'reserved_count' => 0,
+        'occupied_count' => 0,
+        'maintenance_count' => 0,
+        'retired_count' => 0,
+    ];
+    $breakdown = array_fill_keys($typeIds, $empty);
+
+    foreach ($stmt->fetchAll() as $row) {
+        $typeId = (int) $row['type_id'];
+        $breakdown[$typeId] = [
+            'total_count' => (int) $row['total_count'],
+            'available_count' => (int) $row['available_count'],
+            'reserved_count' => (int) $row['reserved_count'],
+            'occupied_count' => (int) $row['occupied_count'],
+            'maintenance_count' => (int) $row['maintenance_count'],
+            'retired_count' => (int) $row['retired_count'],
+        ];
+    }
+
+    return $breakdown;
+}
+
+function lamp_stock_unavailable_message(int $typeId, string $lanternName, int $requestedQuantity = 1): string
+{
+    $breakdown = lamp_stock_breakdown_by_type([$typeId])[$typeId] ?? [
+        'total_count' => 0,
+        'available_count' => 0,
+        'reserved_count' => 0,
+        'occupied_count' => 0,
+        'maintenance_count' => 0,
+        'retired_count' => 0,
+    ];
+
+    $total = (int) $breakdown['total_count'];
+    $available = (int) $breakdown['available_count'];
+    $parts = [];
+
+    if ((int) $breakdown['occupied_count'] > 0) {
+        $parts[] = '已點燈 ' . (int) $breakdown['occupied_count'] . ' 位';
+    }
+    if ((int) $breakdown['reserved_count'] > 0) {
+        $parts[] = '其他會員保留中 ' . (int) $breakdown['reserved_count'] . ' 位';
+    }
+    if ((int) $breakdown['maintenance_count'] > 0) {
+        $parts[] = '維修中 ' . (int) $breakdown['maintenance_count'] . ' 位';
+    }
+    if ((int) $breakdown['retired_count'] > 0) {
+        $parts[] = '已封存 ' . (int) $breakdown['retired_count'] . ' 位';
+    }
+
+    if ($total <= 0) {
+        return $lanternName . ' 目前沒有建立可分配的燈位，請改選其他燈種或聯絡廟方。';
+    }
+
+    $reason = $parts === [] ? '目前沒有可分配燈位' : implode('、', $parts);
+
+    return $lanternName . ' 燈位不足：總燈位 ' . $total . ' 位，目前可用 ' . $available
+        . ' 位，這次需要 ' . $requestedQuantity . ' 位。原因：' . $reason
+        . '。可等待保留逾時釋出、減少數量，或改選其他燈種。';
+}
+
+function lamp_stock_unavailable_message_for_period(int $typeId, string $lanternName, int $requestedQuantity, ?array $period): string
+{
+    if ($period === null) {
+        return lamp_stock_unavailable_message($typeId, $lanternName, $requestedQuantity);
+    }
+
+    $breakdown = lamp_stock_breakdown_by_type_for_period([$typeId], $period)[$typeId] ?? [
+        'total_count' => 0,
+        'available_count' => 0,
+        'reserved_count' => 0,
+        'occupied_count' => 0,
+        'maintenance_count' => 0,
+        'retired_count' => 0,
+    ];
+    $total = (int) $breakdown['total_count'];
+    $available = (int) $breakdown['available_count'];
+
+    if ($total <= 0) {
+        return $lanternName . ' 在 ' . (int) $period['service_year'] . ' 年度沒有建立可分配的燈位，請改選其他燈種或聯絡廟方。';
+    }
+
+    $parts = [];
+    if ((int) $breakdown['reserved_count'] > 0) {
+        $parts[] = '其他會員保留中 ' . (int) $breakdown['reserved_count'] . ' 位';
+    }
+    if ((int) $breakdown['maintenance_count'] > 0) {
+        $parts[] = '維修中 ' . (int) $breakdown['maintenance_count'] . ' 位';
+    }
+    if ((int) $breakdown['retired_count'] > 0) {
+        $parts[] = '已封存 ' . (int) $breakdown['retired_count'] . ' 位';
+    }
+
+    $reason = $parts === [] ? '可延續至下一年度的燈位不足' : implode('、', $parts);
+
+    return $lanternName . ' 在 ' . (int) $period['service_year'] . ' 年度燈位不足：總燈位 ' . $total
+        . ' 位，下一年度可用 ' . $available . ' 位，這次需要 ' . $requestedQuantity
+        . ' 位。原因：' . $reason . '。';
 }
 
 function active_lamp_reservation_for_cart_item(PDO $pdo, int $cartItemId, int $userId): ?array
@@ -162,6 +445,109 @@ function reserve_lamp_position_for_cart_item(PDO $pdo, int $cartItemId, int $typ
     return $stmt->fetch() ?: null;
 }
 
+function reserve_lamp_position_for_cart_item_period(PDO $pdo, int $cartItemId, int $typeId, int $userId, ?array $period): ?array
+{
+    if ($period === null || empty($period['blessing_start_date'])) {
+        return reserve_lamp_position_for_cart_item($pdo, $cartItemId, $typeId, $userId);
+    }
+
+    expire_lamp_reservations($pdo);
+
+    $reservation = active_lamp_reservation_for_cart_item($pdo, $cartItemId, $userId);
+    if ($reservation !== null) {
+        return $reservation;
+    }
+
+    $stmt = $pdo->prepare(
+        'UPDATE lamp_reservations
+         SET status = "cancelled"
+         WHERE cart_item_id = ?
+           AND user_id = ?
+           AND status = "active"'
+    );
+    $stmt->execute([$cartItemId, $userId]);
+
+    $stmt = $pdo->prepare(
+        'SELECT lp.*
+         FROM lamp_positions lp
+         WHERE lp.type_id = ?
+           AND lp.status <> "retired"
+           AND (
+               lp.status = "available"
+               OR lp.occupied_until IS NULL
+               OR lp.occupied_until < ?
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM lamp_reservations lr
+               WHERE lr.position_id = lp.position_id
+                 AND lr.status = "active"
+                 AND lr.expires_at > NOW()
+           )
+         ORDER BY lp.area ASC, lp.row_no ASC, lp.col_no ASC, lp.position_id ASC
+         LIMIT 1
+         FOR UPDATE'
+    );
+    $stmt->execute([$typeId, (string) $period['blessing_start_date']]);
+    $position = $stmt->fetch();
+
+    if (!$position) {
+        return null;
+    }
+
+    $stmt = $pdo->prepare(
+        'INSERT INTO lamp_reservations (
+            cart_item_id,
+            position_id,
+            user_id,
+            reserved_at,
+            expires_at,
+            status
+         ) VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), "active")'
+    );
+    $stmt->execute([
+        $cartItemId,
+        (int) $position['position_id'],
+        $userId,
+        lamp_reservation_minutes(),
+    ]);
+
+    $reservationId = (int) $pdo->lastInsertId();
+    $stmt = $pdo->prepare(
+        'SELECT lr.*, lp.position_code
+         FROM lamp_reservations lr
+         INNER JOIN lamp_positions lp ON lp.position_id = lr.position_id
+         WHERE lr.reservation_id = ?
+         LIMIT 1'
+    );
+    $stmt->execute([$reservationId]);
+
+    return $stmt->fetch() ?: null;
+}
+
+function renewal_source_position_valid(PDO $pdo, int $sourceDetailId, int $positionId, int $typeId, int $dependentId, int $userId): bool
+{
+    $stmt = $pdo->prepare(
+        'SELECT 1
+         FROM order_items oi
+         INNER JOIN orders o ON o.order_id = oi.order_id
+         INNER JOIN lamp_positions lp ON lp.position_id = oi.position_id
+         WHERE oi.detail_id = ?
+           AND oi.position_id = ?
+           AND oi.type_id = ?
+           AND oi.dependent_id = ?
+           AND o.user_id = ?
+           AND o.payment_status = "paid"
+           AND o.review_status = "approved"
+           AND oi.item_status IN ("assigned", "completed")
+           AND lp.status <> "retired"
+         LIMIT 1'
+    );
+    $stmt->execute([$sourceDetailId, $positionId, $typeId, $dependentId, $userId]);
+
+    return (bool) $stmt->fetchColumn();
+}
+
 function refresh_lamp_reservation_for_cart_item(PDO $pdo, int $cartItemId, int $typeId, int $userId): ?array
 {
     expire_lamp_reservations($pdo);
@@ -236,10 +622,22 @@ function active_lamp_service_period(): ?array
         'SELECT *
          FROM lamp_service_periods
          WHERE status = "active"
-         ORDER BY service_year DESC, period_id DESC
+           AND blessing_end_date >= CURDATE()
+         ORDER BY service_year ASC, period_id ASC
          LIMIT 1'
     );
     $period = $stmt->fetch();
+
+    if (!$period) {
+        $stmt = db()->query(
+            'SELECT *
+             FROM lamp_service_periods
+             WHERE status = "active"
+             ORDER BY service_year DESC, period_id DESC
+             LIMIT 1'
+        );
+        $period = $stmt->fetch();
+    }
 
     return $period ?: null;
 }
@@ -276,20 +674,6 @@ function lamp_blessing_start_date(?string $sourceDateTime = null): string
     }
 
     return $date->format('Y-m-d');
-}
-
-function lamp_service_period_by_id(int $periodId): ?array
-{
-    $stmt = db()->prepare(
-        'SELECT *
-         FROM lamp_service_periods
-         WHERE period_id = ?
-         LIMIT 1'
-    );
-    $stmt->execute([$periodId]);
-    $period = $stmt->fetch();
-
-    return $period ?: null;
 }
 
 function annual_flow_match_field_label(string $field): string
@@ -388,6 +772,7 @@ function public_nav(?array $user): string
         ['flow_tables.php', '流年表'],
         ['lanterns.php', '點燈大廳'],
         ['lamp_wall.php', '燈位牆'],
+        ['jiaobei.php', '線上擲筊'],
     ];
 
     if ($user !== null) {
@@ -495,6 +880,7 @@ function lamp_position_status_label(string $status): string
         'reserved' => '保留中',
         'occupied' => '佔用',
         'maintenance' => '維修中',
+        'retired' => '已封存',
     ][$status] ?? $status;
 }
 
@@ -659,16 +1045,24 @@ function audit_action_label(string $action): string
         'admin_lamp_position_create' => '新增燈位',
         'admin_lamp_position_update' => '更新燈位',
         'admin_lamp_position_delete' => '刪除燈位',
+        'admin_lantern_type_delete' => '刪除燈種',
+        'admin_user_delete' => '刪除使用者',
+        'admin_annual_flow_rule_delete' => '刪除流年規則',
+        'admin_article_delete' => '刪除公告文章',
+        'admin_scheduled_job_delete' => '刪除排程',
         'admin_article_create' => '新增文章',
         'admin_article_update' => '更新文章',
         'admin_article_archive' => '封存文章',
         'admin_feedback_reply' => '回覆問題回饋',
         'admin_user_create' => '新增會員帳號',
         'admin_user_update' => '更新會員權限',
+        'admin_account_create' => '新增管理員帳號',
+        'admin_account_toggle' => '切換管理員帳號狀態',
         'admin_service_period_save' => '儲存年度燈期',
         'admin_statistics_generate' => '產生統計報表',
         'admin_scheduled_job_save' => '儲存排程任務',
         'admin_scheduled_job_status' => '更新排程狀態',
+        'admin_renewal_notification_send' => '一鍵發送續點通知',
         'admin_notification_status' => '更新通知狀態',
         'member_notification_read' => '會員已讀通知',
         'member_notification_preferences_update' => '會員更新通知偏好',
